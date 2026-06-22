@@ -23,6 +23,11 @@
 #include "A_Matrix.h"
 #include "input.h"
 
+#ifdef USE_CUDA
+#include "chimes_lsq_gpu.cuh"
+#include <cstdlib>
+#endif
+
 using namespace std;
 
 #ifndef VERBOSITY 
@@ -177,6 +182,29 @@ int main(int argc, char* argv[])
 	A_MAT A_MATRIX ; // Declare and initialize A-matrix object
 
 	read_lsq_input(INFILE, CONTROLS, ATOM_PAIRS, TRIPS, QUADS, PAIR_MAP, INT_PAIR_MAP, CHARGE_CONSTRAINTS, NEIGHBOR_LIST, ATOM_TYPE_IDX, ATOM_TYPE, A_MATRIX);
+
+	if (getenv("CHIMES_LSQ_USE_GPU"))
+		CONTROLS.USE_GPU = true;
+	if (getenv("CHIMES_LSQ_BINARY_A"))
+		CONTROLS.BINARY_A = true;
+
+#ifdef USE_CUDA
+	if (CONTROLS.USE_GPU) {
+		if (lsq_gpu_available()) {
+			int dev = lsq_gpu_device_for_rank(RANK);
+			const char *dev_env = getenv("CHIMES_LSQ_GPU_DEVICE");
+			if (dev_env) dev = atoi(dev_env);
+			lsq_gpu_init(dev);
+			if (RANK == 0)
+				cout << endl << "GPU A-matrix build enabled (CUDA; rank 0 -> device "
+				     << dev << ")" << endl;
+		} else {
+			if (RANK == 0)
+				cout << endl << "WARNING: USE_GPU set but no CUDA device found; using CPU" << endl;
+			CONTROLS.USE_GPU = false;
+		}
+	}
+#endif
 
 	// Build many-body interaction clusters if necessary.
 	build_clusters(CONTROLS, ATOM_PAIRS, TRIPS, QUADS, PAIR_MAP, NEIGHBOR_LIST, ATOM_TYPE_IDX, ATOM_TYPE);
@@ -414,6 +442,10 @@ else
 	//////////////////////////////////////////////////	  
 
 	print_bond_stats(ATOM_PAIRS, TRIPS, QUADS, CONTROLS.USE_3B_CHEBY, CONTROLS.USE_4B_CHEBY);
+
+#ifdef USE_CUDA
+	lsq_gpu_finalize();
+#endif
 
 #ifdef USE_MPI
 MPI_Finalize();

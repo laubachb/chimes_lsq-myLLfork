@@ -189,6 +189,40 @@ void A_MAT::write_natoms(ofstream & OUTFILE)
 	
 }
 
+void A_MAT::begin_A_row()
+{
+	a_row_buf.clear();
+}
+
+void A_MAT::push_A_col(double v)
+{
+	a_row_buf.push_back(v);
+	fileA << v << " ";
+}
+
+void A_MAT::end_A_row()
+{
+	fileA << endl;
+	if (fileAbin.is_open() && !a_row_buf.empty())
+		fileAbin.write(reinterpret_cast<const char*>(a_row_buf.data()),
+		               a_row_buf.size() * sizeof(double));
+	a_row_buf.clear();
+}
+
+void A_MAT::push_A_ones_cols(string item, bool DO_ENER)
+{
+	if (!DO_ENER) return;
+
+	for (int i = 0; i < NO_ATOM_TYPES; i++) {
+		if (DO_EXCLUDE_1B)
+			if (find(EXCLUDE_1B.begin(), EXCLUDE_1B.end(), i) != EXCLUDE_1B.end())
+				continue;
+
+		double v = ((item == "FORCE") || (item == "STRESS")) ? 0.0 : (double)NO_ATOMS_OF_TYPE[i];
+		push_A_col(v);
+	}
+}
+
 bool A_MAT::skip_2b(int n)
 {
 	int tidx,snum;
@@ -237,58 +271,53 @@ void A_MAT::PRINT_FRAME(	const struct JOB_CONTROL &CONTROLS,
 
 	for(int a=0;a<FORCES.size();a++) // Loop over atoms
 	{	
-		// Print Afile: .../////////////// -- For X
-		  
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)	// Afile
+		// X component
+		begin_A_row();
+		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
 		{
 			if(CONTROLS.HIERARCHICAL_FIT)
 				if(skip_2b(n))
 					continue;
-			fileA << FORCES[a][n].X  << "   ";
+			push_A_col(FORCES[a][n].X);
 		}
-		if ( CONTROLS.FIT_COUL ) 
-			for(int i=0; i<CHARGES.size(); i++) // Loop over pair types, i.e. OO, OH, HH
-				fileA << CHARGES[i][a].X << "   ";
+		if ( CONTROLS.FIT_COUL )
+			for(int i=0; i<CHARGES.size(); i++)
+				push_A_col(CHARGES[i][a].X);
+		push_A_ones_cols("FORCE", DO_ENER);
+		write_natoms(filena);
+		end_A_row();
 
-		add_col_of_ones("FORCE", DO_ENER, fileA);
-		write_natoms(filena);			  
-
-		fileA << endl;	
-		  
-		// Print Afile: .../////////////// -- For Y
-		  
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)	// Afile
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			
-			fileA << FORCES[a][n].Y  << "   ";
-		}
-		if ( CONTROLS.FIT_COUL ) 
-			for(int i=0; i<CHARGES.size(); i++) // Loop over pair types, i.e. OO, OH, HH
-				fileA << CHARGES[i][a].Y << "   ";
-		add_col_of_ones("FORCE", DO_ENER, fileA);
-		write_natoms(filena);				  
-		fileA << endl;	
-
-
-		// Print Afile: .../////////////// -- For Z
-		  
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)	// Afile
+		// Y component
+		begin_A_row();
+		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
 		{
 			if(CONTROLS.HIERARCHICAL_FIT)
 				if(skip_2b(n))
 					continue;
-							
-			fileA << FORCES[a][n].Z  << "   ";
+			push_A_col(FORCES[a][n].Y);
 		}
-		if ( CONTROLS.FIT_COUL ) 
-			for(int i=0; i<CHARGES.size(); i++) // Loop over pair types, i.e. OO, OH, HH
-				fileA << CHARGES[i][a].Z << "   ";
-		add_col_of_ones("FORCE", DO_ENER, fileA);
-		write_natoms(filena);				  
-		fileA << endl;		
+		if ( CONTROLS.FIT_COUL )
+			for(int i=0; i<CHARGES.size(); i++)
+				push_A_col(CHARGES[i][a].Y);
+		push_A_ones_cols("FORCE", DO_ENER);
+		write_natoms(filena);
+		end_A_row();
+
+		// Z component
+		begin_A_row();
+		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
+		{
+			if(CONTROLS.HIERARCHICAL_FIT)
+				if(skip_2b(n))
+					continue;
+			push_A_col(FORCES[a][n].Z);
+		}
+		if ( CONTROLS.FIT_COUL )
+			for(int i=0; i<CHARGES.size(); i++)
+				push_A_col(CHARGES[i][a].Z);
+		push_A_ones_cols("FORCE", DO_ENER);
+		write_natoms(filena);
+		end_A_row();
 			
 		// Print Bfile: ...
 			
@@ -627,6 +656,7 @@ void A_MAT::CLEANUP_FILES(bool SPLIT_FILES)
 // Close and clean up the output files.
 {
 	fileA.close();
+	if (fileAbin.is_open()) fileAbin.close();
 	fileb.close();
 	fileb_labeled.close();
 	filena.close();
@@ -654,6 +684,7 @@ void A_MAT::CLEANUP_FILES(bool SPLIT_FILES)
 			// Could make the SVD program read multiple files.
 			system("cat A.[0-9]*.txt > A.txt");
 			system("rm A.[0-9]*.txt");
+			system("cat A.[0-9]*.bin > A.bin 2>/dev/null; rm -f A.[0-9]*.bin");
 		}
 	}
 
@@ -726,17 +757,25 @@ void A_MAT::OPEN_FILES(const JOB_CONTROL &CONTROLS)
 	char nameB[80];
 	char nameBlab[80];
 	char namena[80];
+	char nameAbin[80];
 
 	// Label output files by the processor rank
 	sprintf(nameA, "A.%04d.txt", RANK);
 	sprintf(nameB, "b.%04d.txt", RANK);
 	sprintf(nameBlab, "b-labeled.%04d.txt", RANK);
 	sprintf(namena, "natoms.%04d.txt", RANK);
+	sprintf(nameAbin, "A.%04d.bin", RANK);
 
 	fileA.open(nameA);
 	fileb.open(nameB);
 	fileb_labeled.open(nameBlab);
 	filena.open(namena);
+
+	if (CONTROLS.BINARY_A) {
+		fileAbin.open(nameAbin, ios::binary);
+		if (!fileAbin.good() || !fileAbin.is_open())
+			EXIT_MSG(string("Could not open ") + nameAbin);
+	}
 
 	if ( ! fileA.good() || ! fileA.is_open() )
 		EXIT_MSG(string("Could not open ") + nameA) ;

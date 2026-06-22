@@ -46,6 +46,7 @@ class A_MAT
 	vector<vector<XYZ> >   CHARGES;	        // originally "COULOMB_FORCES" ... [#frames][#pairtypes][#atoms]
 
 	ofstream fileA, fileb, fileb_labeled, filena;
+	ofstream fileAbin;              // optional binary A rows (see BINARY_A)
 	
 	bool			DO_EXCLUDE_1B;	// Are 1-body interactions being excluded?
 	bool			DO_EXCLUDE_2B;	// Are 2-body interactions being excluded?
@@ -74,9 +75,14 @@ class A_MAT
 	private:
 	
 	void add_col_of_ones(string item, bool DO_ENER, ofstream & OUTFILE);
+	void push_A_ones_cols(string item, bool DO_ENER);
+	void begin_A_row();
+	void push_A_col(double v);
+	void end_A_row();
 	void write_natoms(ofstream & OUTFILE);
 	int data_count;
 	int param_count;
+	vector<double> a_row_buf;
 	
 };
 

@@ -16,6 +16,7 @@ DEBUG=${1-0}  # False (0) by default; if false, compiles with -O3, otherwise, us
 PREFX=${2-""} # Empty by default
 VERBO=${3-1}  # Verbosity set to 1 by default, 0 gives minimal output, 3 gives minimal with DEBUG_CHEBY output, 4 gives all output
 DOMPI=${4-1}  # Compile with MPI support by default
+DOGPU=${5-0}  # Compile with CUDA GPU A-matrix support by default off
 
 
 echo "Attempting to perform a fresh install"
@@ -59,6 +60,8 @@ elif [[ "$hosttype" == "JHU-ARCH" ]] ; then
     MPI=`which mpicxx`   
 elif [[ "$hosttype" == "UT-TACC" ]] ; then
     source modfiles/UT-TACC.mod
+elif [[ "$hosttype" == "UT-TACC-GPU" ]] ; then
+    source modfiles/UT-TACC-GPU.mod
 else
     echo ""
     echo "ERROR: Unknown hosttype ($hosttype) specified"
@@ -147,6 +150,10 @@ if [ $DOMPI -eq 1 ] ;then
     my_flags="${my_flags} -DMPI_CXX_COMPILER=${MPI}"
 else
         my_flags="${my_flags} -DUSE_MPI=0" 
+fi
+
+if [ $DOGPU -eq 1 ] ;then
+        my_flags="${my_flags} -DWITH_CUDA=ON"
 fi
 
 echo "compiling with flags: $my_flags"
