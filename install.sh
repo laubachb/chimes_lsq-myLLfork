@@ -10,7 +10,7 @@ echo ""
 # Run with:
 # ./install.sh
 # or
-# ./install.sh <debug option (0 or 1)> <install prefix (full path)> <verbosity option (0 or 1 or 2 or 3)> <MPI option (0 or 1)>
+# ./install.sh <debug option (0 or 1)> <install prefix (full path)> <verbosity option (0 or 1 or 2 or 3)> <MPI option (0 or 1)> <CUDA GPU option (0 or 1)>
 
 DEBUG=${1-0}  # False (0) by default; if false, compiles with -O3, otherwise, uses -g
 PREFX=${2-""} # Empty by default

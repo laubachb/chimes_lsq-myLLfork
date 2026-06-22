@@ -1,5 +1,7 @@
 #!/bin/bash
 # Compare CPU vs GPU A-matrix build for a chimes_lsq test case.
+# Requires a CUDA build: export hosttype=UT-TACC-GPU; ./install.sh 0 "" 1 1 1
+# See doc/GPU_ACCELERATION.md for full GPU documentation and tech debt.
 # Usage: ./scripts/gpu_validate.sh [path/to/test/dir]
 set -euo pipefail
 

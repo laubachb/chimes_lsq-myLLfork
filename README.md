@@ -3,7 +3,30 @@
 </p>
 <hr>
 
-Provide an overview here; explain that the "ChIMES Generator" is chimes-lsq
+**chimes_lsq** is the ChIMES parameter generator: it builds the least-squares design matrix (A) and right-hand side (b) from reference trajectories, then solves for Chebyshev coefficients via `chimes_lsq.py`.
+
+<hr>
+
+Building
+--------
+
+Standard install (MPI enabled by default):
+
+```bash
+export hosttype=UT-TACC    # or UM-ARC, LLNL-LC, etc. — see modfiles/
+./install.sh
+```
+
+Arguments: `./install.sh <debug 0|1> <install_prefix> <verbosity 0-3> <MPI 0|1> <CUDA 0|1>`
+
+**GPU build** (CUDA A-matrix acceleration; requires a GPU module stack):
+
+```bash
+export hosttype=UT-TACC-GPU
+./install.sh 0 "" 1 1 1
+```
+
+See [doc/GPU_ACCELERATION.md](doc/GPU_ACCELERATION.md) for runtime options, validation, and known limitations.
 
 <hr>
 
