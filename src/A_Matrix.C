@@ -15,10 +15,9 @@ using namespace std;
 
 A_MAT::A_MAT(): FORCES(), STRESSES(), FRAME_ENERGIES(), ATOM_ENERGIES(), CHARGES()
 {
-	// Set up A-matrix
-	
 	data_count  = 0;
 	param_count = 0;
+	text_a_output = true;
 }
 
 A_MAT::~A_MAT(){}
@@ -197,16 +196,31 @@ void A_MAT::begin_A_row()
 void A_MAT::push_A_col(double v)
 {
 	a_row_buf.push_back(v);
-	fileA << v << " ";
+	if (text_a_output && fileA.is_open())
+		fileA << v << " ";
 }
 
 void A_MAT::end_A_row()
 {
-	fileA << endl;
+	if (text_a_output && fileA.is_open())
+		fileA << endl;
 	if (fileAbin.is_open() && !a_row_buf.empty())
 		fileAbin.write(reinterpret_cast<const char*>(a_row_buf.data()),
 		               a_row_buf.size() * sizeof(double));
 	a_row_buf.clear();
+}
+
+void A_MAT::write_stress_row(const JOB_CONTROL &CONTROLS, bool DO_ENER, double STENSOR::*comp)
+{
+	begin_A_row();
+	for (int n = 0; n < CONTROLS.TOT_SHORT_RANGE; n++) {
+		if (CONTROLS.HIERARCHICAL_FIT && skip_2b(n))
+			continue;
+		push_A_col(STRESSES[n].*comp);
+	}
+	push_A_ones_cols("STRESS", DO_ENER);
+	write_natoms(filena);
+	end_A_row();
 }
 
 void A_MAT::push_A_ones_cols(string item, bool DO_ENER)
@@ -327,8 +341,6 @@ void A_MAT::PRINT_FRAME(	const struct JOB_CONTROL &CONTROLS,
 			fileb << SYSTEM.FORCES[a].Z << endl;
 			data_count += 3 ;
 			
-			fileb.flush() ;
-			
 			fileb_labeled << CONTROLS.INFILE_FORCE_FLAGS[my_file] << SYSTEM.ATOMTYPE[a] << " " <<  SYSTEM.FORCES[a].X << endl;
 			fileb_labeled << CONTROLS.INFILE_FORCE_FLAGS[my_file] << SYSTEM.ATOMTYPE[a] << " " <<  SYSTEM.FORCES[a].Y << endl;
 			fileb_labeled << CONTROLS.INFILE_FORCE_FLAGS[my_file] << SYSTEM.ATOMTYPE[a] << " " <<  SYSTEM.FORCES[a].Z << endl;
@@ -342,41 +354,9 @@ void A_MAT::PRINT_FRAME(	const struct JOB_CONTROL &CONTROLS,
 		if( N < CONTROLS.NSTRESS)
                 {
 
-		// Output A.txt 
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;
-			fileA << STRESSES[n].XX << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);
-		fileA << endl;	
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << STRESSES[n].YY << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);	
-		write_natoms(filena);
-		fileA << endl;
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << STRESSES[n].ZZ << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);
-		fileA << endl;	
-			
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::XX);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::YY);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::ZZ);
 			
 		// Convert from GPa to internal units to match A-matrix elements
 
@@ -396,106 +376,15 @@ void A_MAT::PRINT_FRAME(	const struct JOB_CONTROL &CONTROLS,
 		if( N < CONTROLS.NSTRESS)
                 {
 						
-		// Output A.txt
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << STRESSES[n].XX << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << STRESSES[n].XY << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;
-		
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << STRESSES[n].XZ << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;	
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;
-			fileA << STRESSES[n].XY << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;	
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;
-			fileA << STRESSES[n].YY << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;	
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;
-			fileA << STRESSES[n].YZ << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;
-			
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;
-			fileA << STRESSES[n].XZ << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);
-		fileA << endl;
-						
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;
-			fileA << STRESSES[n].YZ << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;
-		
-		for(int n=0; n < CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << STRESSES[n].ZZ << " ";
-		}
-		add_col_of_ones("STRESS", DO_ENER, fileA);
-		write_natoms(filena);	
-		fileA << endl;		
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::XX);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::XY);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::XZ);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::XY);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::YY);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::YZ);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::XZ);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::YZ);
+		write_stress_row(CONTROLS, DO_ENER, &STENSOR::ZZ);
 
 		// Account for the symmetry of the off-diagonal (deviatoric) components
 			
@@ -529,45 +418,22 @@ void A_MAT::PRINT_FRAME(	const struct JOB_CONTROL &CONTROLS,
 	}
 	if(CONTROLS.FIT_ENER)
 	{
-		// Check if we need to exclude some energy data from the A and b text files.
 		if(N < CONTROLS.NENER)
 		{
-		// Output A.txt 
-			
-		for(int n=0; n<CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << FRAME_ENERGIES[n] << " ";
-		}
-		add_col_of_ones("ENERGY", DO_ENER, fileA);	
-		write_natoms(filena);			
-		fileA << endl;
-			
-		for(int n=0; n<CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << FRAME_ENERGIES[n] << " ";
-		}
-		add_col_of_ones("ENERGY", DO_ENER, fileA);				
-		write_natoms(filena);
-		fileA << endl;
-			
-		for(int n=0; n<CONTROLS.TOT_SHORT_RANGE; n++)
-		{
-			if(CONTROLS.HIERARCHICAL_FIT)
-				if(skip_2b(n))
-					continue;		
-			fileA << FRAME_ENERGIES[n] << " ";
-		}
-		add_col_of_ones("ENERGY", DO_ENER, fileA);				
-		write_natoms(filena);
-		fileA << endl;						
-			
-		// Output b.txt stuff
+		auto write_energy_A_row = [&]() {
+			begin_A_row();
+			for (int n = 0; n < CONTROLS.TOT_SHORT_RANGE; n++) {
+				if (CONTROLS.HIERARCHICAL_FIT && skip_2b(n))
+					continue;
+				push_A_col(FRAME_ENERGIES[n]);
+			}
+			push_A_ones_cols("ENERGY", DO_ENER);
+			write_natoms(filena);
+			end_A_row();
+		};
+		write_energy_A_row();
+		write_energy_A_row();
+		write_energy_A_row();
 			
 		fileb                  << SYSTEM.QM_POT_ENER << endl;
 		fileb_labeled << CONTROLS.INFILE_ENERGY_FLAGS[my_file] << "+1 " << SYSTEM.QM_POT_ENER << endl;
@@ -766,7 +632,16 @@ void A_MAT::OPEN_FILES(const JOB_CONTROL &CONTROLS)
 	sprintf(namena, "natoms.%04d.txt", RANK);
 	sprintf(nameAbin, "A.%04d.bin", RANK);
 
-	fileA.open(nameA);
+	text_a_output = CONTROLS.TEXT_A;
+
+	if (text_a_output) {
+		fileA.open(nameA);
+		if ( ! fileA.good() || ! fileA.is_open() )
+			EXIT_MSG(string("Could not open ") + nameA) ;
+		fileA.precision(16);
+		fileA << std::scientific;
+	}
+
 	fileb.open(nameB);
 	fileb_labeled.open(nameBlab);
 	filena.open(namena);
@@ -777,9 +652,6 @@ void A_MAT::OPEN_FILES(const JOB_CONTROL &CONTROLS)
 			EXIT_MSG(string("Could not open ") + nameAbin);
 	}
 
-	if ( ! fileA.good() || ! fileA.is_open() )
-		EXIT_MSG(string("Could not open ") + nameA) ;
-
 	if ( ! fileb.good() || ! fileb.is_open() )
 		EXIT_MSG(string("Could not open ") + nameB) ;
 
@@ -789,11 +661,7 @@ void A_MAT::OPEN_FILES(const JOB_CONTROL &CONTROLS)
 	if ( ! filena.good() || ! filena.is_open() )
 		EXIT_MSG(string("Could not open ") + namena) ;		
 
-
-	fileA.precision(16);	//  Reduced precision to 6 for code testing.
-	fileA << std::scientific;
-
-	fileb.precision(16);	//  Usual precision set to 16.
+	fileb.precision(16);
 	fileb << std::scientific;
 
 	param_count = CONTROLS.TOT_ALL_PARAMS ;

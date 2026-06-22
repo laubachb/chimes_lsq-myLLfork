@@ -26,6 +26,9 @@ struct LSQGpuState {
     int device_id;
     int max_pairs, max_trips, max_quads;
     int nparams, natoms, n_pair_types;
+    int batch_frames;
+    int batch_pending;
+    bool static_uploaded;
 
     int *d_a1, *d_a2, *d_ptype;
     double *d_rlen, *d_rab;
@@ -42,7 +45,22 @@ struct LSQGpuState {
     double *d_stress_yy, *d_stress_yz, *d_stress_zz;
     double *d_frame_energies;
 
+    // Frame geometry + lookup (Tier 1)
+    double *d_coords;
+    int    *d_parent;
+    int    *d_atom_type_idx;
+    int    *d_ipm;
+    int    *d_trip_map;
+    int    *d_trip_pair_idx;
+    int    *d_quad_map;
+    int    *d_quad_pair_idx;
+    LSQBoxGpu  h_box;
+    LSQFrameGpu h_frame;
+    int max_coords;
+    unsigned int *d_enum_counter;
+
     int fit_stress, fit_energy;
+    int use_3b, use_4b;
 };
 
 static LSQGpuState g_gpu = {};
@@ -363,6 +381,228 @@ __global__ void kDeriv4B(int nquads,
     }
 }
 
+// --- Tier 1: GPU geometry, neighbor enumeration, static cache ---
+
+__device__ static void lsq_get_dist(const double *coords, const LSQBoxGpu *box,
+                                    int a1, int a2, int use_mic,
+                                    double &rx, double &ry, double &rz, double &rlen)
+{
+    double x1 = coords[a1 * 3 + 0], y1 = coords[a1 * 3 + 1], z1 = coords[a1 * 3 + 2];
+    double x2 = coords[a2 * 3 + 0], y2 = coords[a2 * 3 + 1], z2 = coords[a2 * 3 + 2];
+
+    double s1x = box->invr_hmat[0]*x1 + box->invr_hmat[1]*y1 + box->invr_hmat[2]*z1;
+    double s1y = box->invr_hmat[3]*x1 + box->invr_hmat[4]*y1 + box->invr_hmat[5]*z1;
+    double s1z = box->invr_hmat[6]*x1 + box->invr_hmat[7]*y1 + box->invr_hmat[8]*z1;
+    double s2x = box->invr_hmat[0]*x2 + box->invr_hmat[1]*y2 + box->invr_hmat[2]*z2;
+    double s2y = box->invr_hmat[3]*x2 + box->invr_hmat[4]*y2 + box->invr_hmat[5]*z2;
+    double s2z = box->invr_hmat[6]*x2 + box->invr_hmat[7]*y2 + box->invr_hmat[8]*z2;
+
+    double tx = s2x - s1x, ty = s2y - s1y, tz = s2z - s1z;
+    if (use_mic) {
+        tx -= round(tx);
+        ty -= round(ty);
+        tz -= round(tz);
+    }
+    rx = box->hmat[0]*tx + box->hmat[1]*ty + box->hmat[2]*tz;
+    ry = box->hmat[3]*tx + box->hmat[4]*ty + box->hmat[5]*tz;
+    rz = box->hmat[6]*tx + box->hmat[7]*ty + box->hmat[8]*tz;
+    rlen = sqrt(rx*rx + ry*ry + rz*rz);
+}
+
+__device__ static int lsq_cluster_id3(int t0, int t1, int t2, int max_types)
+{
+    return (t0 + 1) + (t1 + 1) * max_types + (t2 + 1) * max_types * max_types;
+}
+
+__device__ static int lsq_cluster_id4(int t0, int t1, int t2, int t3, int max_types)
+{
+    return lsq_cluster_id3(t0, t1, t2, max_types) + (t3 + 1) * max_types * max_types * max_types;
+}
+
+__global__ void kEnum2B(const double *coords, const int *parent, const int *atype,
+                        const int *ipm, const LSQPairParams *pp,
+                        LSQBoxGpu box, LSQFrameGpu frame,
+                        int *o_a1, int *o_a2, int *o_pt, double *o_rlen, double *o_rab,
+                        unsigned int *counter, int cap)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nall = frame.nall;
+    int natoms = frame.natoms;
+    int jobs = natoms * nall;
+    if (tid >= jobs) return;
+
+    int a1 = tid / nall;
+    int a2 = tid % nall;
+    if (a2 == a1) return;
+
+    double rx, ry, rz, rlen;
+    lsq_get_dist(coords, &box, a1, a2, frame.use_mic, rx, ry, rz, rlen);
+    if (rlen >= frame.rcut_2b + frame.rcut_pad) return;
+
+    int t1 = atype[parent[a1]];
+    int t2 = atype[parent[a2]];
+    int pt = ipm[t1 * frame.natmtyp + t2];
+    const LSQPairParams &p = pp[pt];
+    if (rlen <= p.s_minim || rlen >= p.s_maxim) return;
+
+    unsigned int slot = atomicAdd(counter, 1u);
+    if (slot >= (unsigned)cap) return;
+    o_a1[slot] = a1;
+    o_a2[slot] = parent[a2];
+    o_pt[slot] = pt;
+    o_rlen[slot] = rlen;
+    o_rab[slot * 3 + 0] = rx;
+    o_rab[slot * 3 + 1] = ry;
+    o_rab[slot * 3 + 2] = rz;
+}
+
+__global__ void kEnum3B(const double *coords, const int *parent, const int *atype,
+                        const int *ipm, const LSQPairParams *pp,
+                        const int *trip_map, const int *trip_pair_idx,
+                        const LSQClusterGpu *clusters,
+                        LSQBoxGpu box, LSQFrameGpu frame,
+                        LSQTripGpu *out, unsigned int *counter, int cap)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nall = frame.nall;
+    int natoms = frame.natoms;
+    long long jobs = (long long)natoms * nall * nall;
+    if ((long long)tid >= jobs) return;
+
+    int a1 = tid / (nall * nall);
+    int rem = tid % (nall * nall);
+    int a2 = rem / nall;
+    int a3 = rem % nall;
+    if (a2 == a1 || a3 == a1 || a3 == a2) return;
+    if (frame.perm_3b == 1.0 && parent[a2] > parent[a3]) return;
+
+    double rlen[3], rab[9];
+    lsq_get_dist(coords, &box, a1, a2, frame.use_mic, rab[0], rab[1], rab[2], rlen[0]);
+    if (rlen[0] >= frame.rcut_3b + frame.rcut_pad) return;
+    lsq_get_dist(coords, &box, a1, a3, frame.use_mic, rab[3], rab[4], rab[5], rlen[1]);
+    if (rlen[1] >= frame.rcut_3b + frame.rcut_pad) return;
+    lsq_get_dist(coords, &box, a2, a3, frame.use_mic, rab[6], rab[7], rab[8], rlen[2]);
+    if (rlen[2] >= frame.rcut_3b + frame.rcut_pad) return;
+
+    int t0 = atype[parent[a1]], t1 = atype[parent[a2]], t2 = atype[parent[a3]];
+    int cmap = lsq_cluster_id3(t0, t1, t2, LSQ_MAX_ATOM_TYPES);
+    if (cmap < 0 || cmap >= LSQ_MAX_TRIP_MAP) return;
+    int cidx = trip_map[cmap];
+    if (cidx < 0) return;
+
+    const LSQClusterGpu &cl = clusters[cidx];
+    int pi[3] = { trip_pair_idx[cmap * 3 + 0], trip_pair_idx[cmap * 3 + 1], trip_pair_idx[cmap * 3 + 2] };
+    for (int e = 0; e < 3; e++) {
+        if (!lsq_proceed(rlen[e], cl.s_minim[pi[e]], cl.s_maxim[pi[e]], cl.fcut_type))
+            return;
+    }
+
+    int pt[3] = {
+        ipm[t0 * frame.natmtyp + t1],
+        ipm[t0 * frame.natmtyp + t2],
+        ipm[atype[parent[a2]] * frame.natmtyp + atype[parent[a3]]]
+    };
+
+    unsigned int slot = atomicAdd(counter, 1u);
+    if (slot >= (unsigned)cap) return;
+
+    LSQTripGpu tr = {};
+    tr.a1 = a1;
+    tr.a2 = parent[a2];
+    tr.a3 = parent[a3];
+    tr.cluster_idx = cidx;
+    for (int k = 0; k < 3; k++) {
+        tr.pair_index[k] = pi[k];
+        tr.pt[k] = pt[k];
+        tr.rlen[k] = rlen[k];
+        tr.lambda[k] = pp[pt[k]].lambda;
+        tr.cheby_type[k] = pp[pt[k]].cheby_type;
+        tr.snum[k] = pp[pt[k]].snum_3b;
+        tr.rab[k * 3 + 0] = rab[k * 3 + 0];
+        tr.rab[k * 3 + 1] = rab[k * 3 + 1];
+        tr.rab[k * 3 + 2] = rab[k * 3 + 2];
+    }
+    out[slot] = tr;
+}
+
+__global__ void kEnum4B(const double *coords, const int *parent, const int *atype,
+                        const int *ipm, const LSQPairParams *pp,
+                        const int *quad_map, const int *quad_pair_idx,
+                        const LSQClusterGpu *clusters,
+                        LSQBoxGpu box, LSQFrameGpu frame,
+                        LSQQuadGpu *out, unsigned int *counter, int cap)
+{
+    long long tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nall = frame.nall;
+    int natoms = frame.natoms;
+    long long cube = (long long)nall * nall * nall;
+    long long jobs = (long long)natoms * cube;
+    if (tid >= jobs) return;
+
+    int a1 = (int)(tid / cube);
+    long long rem = tid % cube;
+    int a2 = (int)(rem / (nall * nall));
+    rem = rem % (nall * nall);
+    int a3 = (int)(rem / nall);
+    int a4 = (int)(rem % nall);
+
+    if (a2 == a1 || a3 == a1 || a4 == a1 || a3 == a2 || a4 == a2 || a4 == a3) return;
+    if (frame.perm_4b == 1.0 && parent[a2] > parent[a3]) return;
+    if (frame.perm_4b == 1.0 && parent[a3] > parent[a4]) return;
+
+    int pairs[6][2] = {{a1,a2},{a1,a3},{a1,a4},{a2,a3},{a2,a4},{a3,a4}};
+    double rlen[6], rab[18];
+    for (int e = 0; e < 6; e++) {
+        lsq_get_dist(coords, &box, pairs[e][0], pairs[e][1], frame.use_mic,
+                     rab[e*3+0], rab[e*3+1], rab[e*3+2], rlen[e]);
+        if (rlen[e] >= frame.rcut_4b + frame.rcut_pad) return;
+    }
+
+    int t0 = atype[parent[a1]], t1 = atype[parent[a2]];
+    int t2 = atype[parent[a3]], t3 = atype[parent[a4]];
+    int cmap = lsq_cluster_id4(t0, t1, t2, t3, LSQ_MAX_ATOM_TYPES);
+    if (cmap < 0 || cmap >= LSQ_MAX_QUAD_MAP) return;
+    int cidx = quad_map[cmap];
+    if (cidx < 0) return;
+
+    const LSQClusterGpu &cl = clusters[cidx];
+    int pi[6];
+    for (int f = 0; f < 6; f++) pi[f] = quad_pair_idx[cmap * 6 + f];
+    for (int e = 0; e < 6; e++) {
+        if (!lsq_proceed(rlen[e], cl.s_minim[pi[e]], cl.s_maxim[pi[e]], cl.fcut_type))
+            return;
+    }
+
+    int pt[6] = {
+        ipm[t0*frame.natmtyp+t1], ipm[t0*frame.natmtyp+t2], ipm[t0*frame.natmtyp+t3],
+        ipm[atype[parent[a2]]*frame.natmtyp+atype[parent[a3]]],
+        ipm[atype[parent[a2]]*frame.natmtyp+atype[parent[a4]]],
+        ipm[atype[parent[a3]]*frame.natmtyp+atype[parent[a4]]]
+    };
+
+    unsigned int slot = atomicAdd(counter, 1u);
+    if (slot >= (unsigned)cap) return;
+
+    LSQQuadGpu qd = {};
+    qd.a1 = a1;
+    qd.a2 = parent[a2];
+    qd.a3 = parent[a3];
+    qd.a4 = parent[a4];
+    qd.cluster_idx = cidx;
+    for (int f = 0; f < 6; f++) {
+        qd.pair_index[f] = pi[f];
+        qd.pt[f] = pt[f];
+        qd.rlen[f] = rlen[f];
+        qd.lambda[f] = pp[pt[f]].lambda;
+        qd.cheby_type[f] = pp[pt[f]].cheby_type;
+        qd.snum[f] = pp[pt[f]].snum_4b;
+        qd.rab[f*3+0] = rab[f*3+0];
+        qd.rab[f*3+1] = rab[f*3+1];
+        qd.rab[f*3+2] = rab[f*3+2];
+    }
+    out[slot] = qd;
+}
+
 static bool ensure_accum(int nparams, int natoms)
 {
     if (g_gpu.nparams >= nparams && g_gpu.natoms >= natoms &&
@@ -459,6 +699,8 @@ void lsq_gpu_init(int device_id)
     cudaSetDevice(device_id);
     cudaDeviceSetLimit(cudaLimitStackSize, 16384);
     g_gpu.device_id = device_id;
+    g_gpu.batch_frames = 1;
+    g_gpu.batch_pending = 0;
     g_gpu.initialized = true;
 }
 
@@ -500,6 +742,15 @@ void lsq_gpu_finalize()
     if (g_gpu.d_stress_yz) cudaFree(g_gpu.d_stress_yz);
     if (g_gpu.d_stress_zz) cudaFree(g_gpu.d_stress_zz);
     if (g_gpu.d_frame_energies) cudaFree(g_gpu.d_frame_energies);
+    if (g_gpu.d_coords) cudaFree(g_gpu.d_coords);
+    if (g_gpu.d_parent) cudaFree(g_gpu.d_parent);
+    if (g_gpu.d_atom_type_idx) cudaFree(g_gpu.d_atom_type_idx);
+    if (g_gpu.d_ipm) cudaFree(g_gpu.d_ipm);
+    if (g_gpu.d_trip_map) cudaFree(g_gpu.d_trip_map);
+    if (g_gpu.d_trip_pair_idx) cudaFree(g_gpu.d_trip_pair_idx);
+    if (g_gpu.d_quad_map) cudaFree(g_gpu.d_quad_map);
+    if (g_gpu.d_quad_pair_idx) cudaFree(g_gpu.d_quad_pair_idx);
+    if (g_gpu.d_enum_counter) cudaFree(g_gpu.d_enum_counter);
     g_gpu = {};
 }
 
@@ -632,6 +883,238 @@ bool lsq_gpu_finish_frame_accum(
     CUDA_CHECK(cudaMemcpy(h_stress_yz, g_gpu.d_stress_yz, nparams * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_stress_zz, g_gpu.d_stress_zz, nparams * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_frame_energies, g_gpu.d_frame_energies, nparams * sizeof(double), cudaMemcpyDeviceToHost));
+    g_gpu.batch_pending++;
+    if (g_gpu.batch_frames > 1 && g_gpu.batch_pending < g_gpu.batch_frames)
+        return true;
+    g_gpu.batch_pending = 0;
+    return true;
+}
+
+void lsq_gpu_set_batch_frames(int n)
+{
+    if (n < 1) n = 1;
+    g_gpu.batch_frames = n;
+}
+
+int lsq_gpu_batch_frames() { return g_gpu.batch_frames; }
+
+void lsq_gpu_flush_batch()
+{
+    if (!g_gpu.initialized) return;
+    cudaDeviceSynchronize();
+    g_gpu.batch_pending = 0;
+}
+
+static bool ensure_geo(int nall)
+{
+    if (g_gpu.max_coords >= nall && g_gpu.d_coords) return true;
+    if (g_gpu.d_coords) cudaFree(g_gpu.d_coords);
+    if (g_gpu.d_parent) cudaFree(g_gpu.d_parent);
+    if (g_gpu.d_atom_type_idx) cudaFree(g_gpu.d_atom_type_idx);
+    int cap = (nall < 256) ? 256 : nall;
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_coords, cap * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_parent, cap * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_atom_type_idx, cap * sizeof(int)));
+    if (!g_gpu.d_enum_counter)
+        CUDA_CHECK(cudaMalloc(&g_gpu.d_enum_counter, sizeof(unsigned int)));
+    g_gpu.max_coords = cap;
+    return true;
+}
+
+static bool ensure_maps()
+{
+    if (g_gpu.d_ipm) return true;
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_ipm, LSQ_MAX_ATOM_TYPES2 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_trip_map, LSQ_MAX_TRIP_MAP * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_trip_pair_idx, LSQ_MAX_TRIP_MAP * 3 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_quad_map, LSQ_MAX_QUAD_MAP * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_quad_pair_idx, LSQ_MAX_QUAD_MAP * 6 * sizeof(int)));
+    return true;
+}
+
+bool lsq_gpu_upload_static_tables(
+    int natmtyp, int n_pair_types,
+    const int *h_ipm,
+    const LSQPairParams *h_pair_params,
+    int use_3b, const int *h_trip_map, const int *h_trip_pair_idx,
+    int n_trip_clusters, const LSQClusterGpu *h_trip_clusters,
+    int n_trip_terms, const LSQPowerTermGpu *h_trip_terms,
+    int use_4b, const int *h_quad_map, const int *h_quad_pair_idx,
+    int n_quad_clusters, const LSQClusterGpu *h_quad_clusters,
+    int n_quad_terms, const LSQPowerTermGpu *h_quad_terms)
+{
+    if (!g_gpu.initialized) return false;
+    if (!ensure_maps()) return false;
+    if (!ensure_2b(4096, n_pair_types)) return false;
+
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_ipm, h_ipm, LSQ_MAX_ATOM_TYPES2 * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_pair_params, h_pair_params,
+                          n_pair_types * sizeof(LSQPairParams), cudaMemcpyHostToDevice));
+    g_gpu.n_pair_types = n_pair_types;
+    g_gpu.use_3b = use_3b;
+    g_gpu.use_4b = use_4b;
+
+    if (use_3b) {
+        if (!ensure_3b(4096, n_trip_clusters, n_trip_terms)) return false;
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_trip_map, h_trip_map, LSQ_MAX_TRIP_MAP * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_trip_pair_idx, h_trip_pair_idx,
+                              LSQ_MAX_TRIP_MAP * 3 * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_trip_clusters, h_trip_clusters,
+                              n_trip_clusters * sizeof(LSQClusterGpu), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_trip_power_terms, h_trip_terms,
+                              n_trip_terms * sizeof(LSQPowerTermGpu), cudaMemcpyHostToDevice));
+        g_gpu.n_trip_clusters = n_trip_clusters;
+        g_gpu.n_trip_power_terms = n_trip_terms;
+    }
+    if (use_4b) {
+        if (!ensure_4b(4096, n_quad_clusters, n_quad_terms)) return false;
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_quad_map, h_quad_map, LSQ_MAX_QUAD_MAP * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_quad_pair_idx, h_quad_pair_idx,
+                              LSQ_MAX_QUAD_MAP * 6 * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_quad_clusters, h_quad_clusters,
+                              n_quad_clusters * sizeof(LSQClusterGpu), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(g_gpu.d_quad_power_terms, h_quad_terms,
+                              n_quad_terms * sizeof(LSQPowerTermGpu), cudaMemcpyHostToDevice));
+        g_gpu.n_quad_clusters = n_quad_clusters;
+        g_gpu.n_quad_power_terms = n_quad_terms;
+    }
+    g_gpu.static_uploaded = true;
+    return true;
+}
+
+bool lsq_gpu_upload_frame(
+    const double *h_coords, int nall,
+    const int *h_parent, const int *h_atom_type_idx,
+    const LSQBoxGpu *box, const LSQFrameGpu *frame)
+{
+    if (!g_gpu.initialized || !g_gpu.static_uploaded) return false;
+    if (!ensure_geo(nall)) return false;
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_coords, h_coords, nall * 3 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_parent, h_parent, nall * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_atom_type_idx, h_atom_type_idx, nall * sizeof(int), cudaMemcpyHostToDevice));
+    g_gpu.h_box = *box;
+    g_gpu.h_frame = *frame;
+    return true;
+}
+
+static bool read_enum_count(int cap, int *out_n)
+{
+    unsigned int hcount = 0;
+    CUDA_CHECK(cudaMemcpy(&hcount, g_gpu.d_enum_counter, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    if ((int)hcount > cap) {
+        fprintf(stderr, "GPU enum overflow: %u > %d (increase caps or reduce system)\n", hcount, cap);
+        return false;
+    }
+    *out_n = (int)hcount;
+    return true;
+}
+
+bool lsq_gpu_enumerate_2b(int *out_npairs)
+{
+    if (!g_gpu.initialized) return false;
+    int cap = g_gpu.max_pairs;
+    unsigned int z = 0;
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_enum_counter, &z, sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+    int nall = g_gpu.h_frame.nall;
+    int natoms = g_gpu.h_frame.natoms;
+    int jobs = natoms * nall;
+    int block = 256, grid = (jobs + block - 1) / block;
+    kEnum2B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
+        g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.h_box, g_gpu.h_frame,
+        g_gpu.d_a1, g_gpu.d_a2, g_gpu.d_ptype, g_gpu.d_rlen, g_gpu.d_rab,
+        g_gpu.d_enum_counter, cap);
+    CUDA_CHECK(cudaGetLastError());
+    return read_enum_count(cap, out_npairs);
+}
+
+bool lsq_gpu_enumerate_3b(int *out_ntrips)
+{
+    if (!g_gpu.initialized || !g_gpu.use_3b) { *out_ntrips = 0; return true; }
+    int cap = g_gpu.max_trips;
+    unsigned int z = 0;
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_enum_counter, &z, sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+    int nall = g_gpu.h_frame.nall;
+    int natoms = g_gpu.h_frame.natoms;
+    long long jobs = (long long)natoms * nall * nall;
+    int block = 256;
+    int grid = (int)((jobs + block - 1) / block);
+    kEnum3B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
+        g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.d_trip_map, g_gpu.d_trip_pair_idx,
+        g_gpu.d_trip_clusters, g_gpu.h_box, g_gpu.h_frame,
+        g_gpu.d_trips, g_gpu.d_enum_counter, cap);
+    CUDA_CHECK(cudaGetLastError());
+    return read_enum_count(cap, out_ntrips);
+}
+
+bool lsq_gpu_enumerate_4b(int *out_nquads)
+{
+    if (!g_gpu.initialized || !g_gpu.use_4b) { *out_nquads = 0; return true; }
+    int cap = g_gpu.max_quads;
+    unsigned int z = 0;
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_enum_counter, &z, sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+    int nall = g_gpu.h_frame.nall;
+    int natoms = g_gpu.h_frame.natoms;
+    long long cube = (long long)nall * nall * nall;
+    long long jobs = (long long)natoms * cube;
+    int block = 256;
+    int grid = (int)((jobs + block - 1) / block);
+    kEnum4B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
+        g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.d_quad_map, g_gpu.d_quad_pair_idx,
+        g_gpu.d_quad_clusters, g_gpu.h_box, g_gpu.h_frame,
+        g_gpu.d_quads, g_gpu.d_enum_counter, cap);
+    CUDA_CHECK(cudaGetLastError());
+    return read_enum_count(cap, out_nquads);
+}
+
+bool lsq_gpu_launch_deriv_2b_device(
+    int npairs, int nparams, int natoms,
+    double perm_scale, double deriv_const, int fit_stress, int fit_energy)
+{
+    if (!g_gpu.initialized || npairs == 0) return true;
+    int block = 256, grid = (npairs + block - 1) / block;
+    kDeriv2B<<<grid, block>>>(npairs, g_gpu.d_a1, g_gpu.d_a2, g_gpu.d_ptype,
+        g_gpu.d_rlen, g_gpu.d_rab, g_gpu.d_pair_params, nparams, natoms,
+        perm_scale, deriv_const, fit_stress, fit_energy,
+        g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
+        g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
+        g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
+        g_gpu.d_frame_energies);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool lsq_gpu_launch_deriv_3b_device(
+    int ntrips, int nparams, int natoms,
+    double perm_scale, double deriv_const, int fit_stress, int fit_energy)
+{
+    if (!g_gpu.initialized || ntrips == 0) return true;
+    int block = 256, grid = (ntrips + block - 1) / block;
+    kDeriv3B<<<grid, block>>>(ntrips, g_gpu.d_trips, g_gpu.d_trip_clusters, g_gpu.d_trip_power_terms,
+        nparams, natoms, perm_scale, deriv_const, fit_stress, fit_energy,
+        g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
+        g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
+        g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
+        g_gpu.d_frame_energies);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool lsq_gpu_launch_deriv_4b_device(
+    int nquads, int nparams, int natoms,
+    double perm_scale, double deriv_const, int fit_stress, int fit_energy)
+{
+    if (!g_gpu.initialized || nquads == 0) return true;
+    int block = 256, grid = (nquads + block - 1) / block;
+    kDeriv4B<<<grid, block>>>(nquads, g_gpu.d_quads, g_gpu.d_quad_clusters, g_gpu.d_quad_power_terms,
+        nparams, natoms, perm_scale, deriv_const, fit_stress, fit_energy,
+        g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
+        g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
+        g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
+        g_gpu.d_frame_energies);
+    CUDA_CHECK(cudaGetLastError());
     return true;
 }
 

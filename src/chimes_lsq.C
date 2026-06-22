@@ -187,6 +187,10 @@ int main(int argc, char* argv[])
 		CONTROLS.USE_GPU = true;
 	if (getenv("CHIMES_LSQ_BINARY_A"))
 		CONTROLS.BINARY_A = true;
+	if (getenv("CHIMES_LSQ_SKIP_TEXT_A"))
+		CONTROLS.TEXT_A = false;
+	else if (CONTROLS.BINARY_A && getenv("CHIMES_LSQ_BINARY_ONLY"))
+		CONTROLS.TEXT_A = false;
 
 #ifdef USE_CUDA
 	if (CONTROLS.USE_GPU) {
@@ -195,6 +199,12 @@ int main(int argc, char* argv[])
 			const char *dev_env = getenv("CHIMES_LSQ_GPU_DEVICE");
 			if (dev_env) dev = atoi(dev_env);
 			lsq_gpu_init(dev);
+			const char *batch_env = getenv("CHIMES_LSQ_GPU_BATCH_FRAMES");
+			if (batch_env)
+				CONTROLS.GPU_BATCH_FRAMES = atoi(batch_env);
+			if (CONTROLS.GPU_BATCH_FRAMES < 1)
+				CONTROLS.GPU_BATCH_FRAMES = 1;
+			lsq_gpu_set_batch_frames(CONTROLS.GPU_BATCH_FRAMES);
 			if (RANK == 0)
 				cout << endl << "GPU A-matrix build enabled (CUDA; rank 0 -> device "
 				     << dev << ")" << endl;
@@ -444,6 +454,7 @@ else
 	print_bond_stats(ATOM_PAIRS, TRIPS, QUADS, CONTROLS.USE_3B_CHEBY, CONTROLS.USE_4B_CHEBY);
 
 #ifdef USE_CUDA
+	lsq_gpu_flush_batch();
 	lsq_gpu_finalize();
 #endif
 
@@ -819,7 +830,15 @@ static int process_frame(	A_MAT &A_MATRIX,
 			}
 	 }		
 	 NEIGHBOR_LIST.INITIALIZE(SYSTEM, NEIGHBOR_PADDING);
-	 NEIGHBOR_LIST.DO_UPDATE (SYSTEM, CONTROLS);		
+#ifdef USE_CUDA
+	 if (CONTROLS.USE_GPU) {
+		 NEIGHBOR_LIST.PERM_SCALE[0] = 1.0;
+		 NEIGHBOR_LIST.PERM_SCALE[1] = 1.0;
+		 for (size_t j = 2; j < NEIGHBOR_LIST.PERM_SCALE.size(); j++)
+			 NEIGHBOR_LIST.PERM_SCALE[j] = NEIGHBOR_LIST.PERM_SCALE[j - 1] / (double)j;
+	 } else
+#endif
+	 NEIGHBOR_LIST.DO_UPDATE (SYSTEM, CONTROLS);
 
 	 ZCalc_Deriv(CONTROLS, ATOM_PAIRS, TRIPS, QUADS, SYSTEM, A_MATRIX, PAIR_MAP, INT_PAIR_MAP, NEIGHBOR_LIST);
 		

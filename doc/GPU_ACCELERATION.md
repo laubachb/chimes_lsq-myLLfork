@@ -10,9 +10,12 @@ Optional CUDA support speeds up the Chebyshev derivative step that builds the de
 | 3-body (`Deriv_3B`) CUDA kernel | Implemented |
 | 4-body (`Deriv_4B`) CUDA kernel | Implemented |
 | MPI rank → GPU device mapping | Implemented |
-| Binary A-matrix output (force rows) | Implemented |
+| GPU neighbor enumeration (fused 2B/3B/4B) | Implemented |
+| Static device table cache | Implemented |
+| Binary A-matrix output (force/stress/energy rows) | Implemented |
 | CPU fallback for unsupported cases | Implemented |
-| Multi-frame GPU batching | Not implemented |
+| Multi-frame device batching (single D2H) | Not implemented |
+| `CHIMES_LSQ_GPU_BATCH_FRAMES` sync grouping | Partial |
 | Binary A reader in `chimes_lsq.py` | Not implemented |
 | CI / automated GPU validation | Not implemented |
 
@@ -73,14 +76,29 @@ The script runs CPU and GPU builds in a temp directory and compares `A`/`b` text
 
 **Not yet done:** validation on Stampede3 GPU compute nodes in CI; 4B-specific regression case; stress/energy-inclusive fits.
 
+## Tier 1 pipeline (implemented)
+
+When `USE_GPU` is enabled, the GPU path now:
+
+1. **Skips CPU neighbor-list rebuild** (`DO_UPDATE`) and enumerates pairs/trips/quads on device from coordinates (MIC-aware).
+2. **Caches static tables** on device (pair params, cluster metadata, type lookup maps) across frames.
+3. **Fuses enumeration + derivative kernels** — no host-side `build_*` pair lists.
+4. **Optional binary-only A output** — set `CHIMES_LSQ_BINARY_A=1` and `CHIMES_LSQ_BINARY_ONLY=1` (or `# BINARYA #` + skip text) to write `A.NNNN.bin` without `A.NNNN.txt`. Stress and energy rows are included in binary when fitted.
+
+| Variable | Effect |
+|----------|--------|
+| `CHIMES_LSQ_GPU_BATCH_FRAMES=N` | Group CUDA sync points (default 1) |
+| `CHIMES_LSQ_BINARY_ONLY=1` | Suppress `A.NNNN.txt` when binary is enabled |
+| `CHIMES_LSQ_SKIP_TEXT_A=1` | Same as above |
+
 ## Architecture
 
 ```
 ZCalc_Deriv (functions.C)
   └─ lsq_gpu_deriv_cheby()          [chimes_lsq_gpu_host.cpp]
-       ├─ build_2b_pairs / build_trips / build_quads
-       ├─ build_cluster_tables (3B/4B metadata)
-       ├─ lsq_gpu_launch_deriv_2b/3b/4b   [chimes_lsq_gpu.cu]
+       ├─ upload static tables (once) + frame coords
+       ├─ lsq_gpu_enumerate_2b/3b/4b  [GPU neighbor + cluster filter]
+       ├─ lsq_gpu_launch_deriv_*_device
        └─ scatter_to_amat → A_MAT
 ```
 
@@ -105,9 +123,9 @@ Kernels mirror CPU `Cheby::Deriv_2B`, `Deriv_3B`, and `Deriv_4B` (cluster cutoff
 Track these when extending or reviewing the GPU path:
 
 1. **Inner-cutoff Cheby fixes** — Port `Cheby::cheby_fix` logic into GPU `set_polys` / derivative evaluation.
-2. **Multi-frame batching** — `JOB_CONTROL.GPU_BATCH_FRAMES` is reserved; currently one frame per GPU accumulation.
-3. **Binary A format** — Only force rows go to `A.NNNN.bin`; stress and energy rows remain text-only. `chimes_lsq.py` / DLASSO do not read binary A yet.
-4. **Host-side caching** — Trip/quad cluster tables and pair params are rebuilt and re-uploaded every frame; cache when geometry/hyperparameters are unchanged across frames.
+2. **True multi-frame device batching** — accumulate N frames on GPU before host download (needs per-frame device buffers).
+3. **Binary A reader** — `chimes_lsq.py` / DLASSO do not read `A.NNNN.bin` yet.
+4. **Host-side caching** — static tables cached on device; coords still uploaded per frame.
 5. **Polynomial order cap** — Raise or remove `LSQ_MAX_POLY_ORDER` (affects GPU stack arrays in 4B kernel).
 6. **Automated testing** — Add GPU-node job to CI or document a manual release checklist; extend `gpu_validate.sh` for 4B and stress/energy fits.
 7. **Performance profiling** — Measure PCIe transfer vs kernel time; consider persistent device buffers and CUDA graphs for production campaigns.

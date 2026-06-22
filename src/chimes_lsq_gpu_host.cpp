@@ -11,6 +11,7 @@
 #include "Cluster.h"
 
 #include <vector>
+#include <cstring>
 
 static int cheby_type_to_int(Cheby_trans t)
 {
@@ -21,18 +22,13 @@ static int cheby_type_to_int(Cheby_trans t)
     }
 }
 
-static int pair_type_idx(FRAME &sys, JOB_CONTROL &ctrl, vector<int> &ipm,
-                         int a1, int a2)
-{
-    return ipm[sys.ATOMTYPE_IDX[sys.PARENT[a1]] * ctrl.NATMTYP +
-               sys.ATOMTYPE_IDX[sys.PARENT[a2]]];
-}
-
 static void fill_pair_params(vector<PAIRS> &ff, std::vector<LSQPairParams> &h_pp)
 {
     h_pp.resize(ff.size());
     for (size_t p = 0; p < ff.size(); p++) {
         h_pp[p].snum        = ff[p].SNUM;
+        h_pp[p].snum_3b     = ff[p].SNUM_3B_CHEBY;
+        h_pp[p].snum_4b     = ff[p].SNUM_4B_CHEBY;
         h_pp[p].vstart      = (int)p * ff[p].SNUM;
         h_pp[p].s_minim     = ff[p].S_MINIM;
         h_pp[p].s_maxim     = ff[p].S_MAXIM;
@@ -82,6 +78,21 @@ static void build_cluster_tables(CLUSTER_LIST &list, int npairs_per_cluster,
     }
 }
 
+static void fill_cluster_map(CLUSTER_LIST &list, int map_size, int npairs,
+                             std::vector<int> &cluster_map,
+                             std::vector<int> &pair_idx_flat)
+{
+    cluster_map.assign(map_size, -1);
+    pair_idx_flat.assign(map_size * npairs, 0);
+    for (size_t i = 0; i < list.INT_MAP.size() && (int)i < map_size; i++) {
+        cluster_map[i] = list.INT_MAP[i];
+        if ((int)i < (int)list.PAIR_INDICES.size()) {
+            for (int k = 0; k < npairs; k++)
+                pair_idx_flat[i * npairs + k] = list.PAIR_INDICES[i][k];
+        }
+    }
+}
+
 static void scatter_to_amat(A_MAT &a_matrix, JOB_CONTROL &controls,
                             int nparams, int natoms, double inv_vol,
                             int fit_stress,
@@ -126,224 +137,105 @@ static void scatter_to_amat(A_MAT &a_matrix, JOB_CONTROL &controls,
     }
 }
 
-static void build_trips(Cheby &cheby, CLUSTER_LIST &trips,
-                        std::vector<LSQTripGpu> &out)
+static bool upload_frame_geometry(FRAME &system, NEIGHBORS &nlist, JOB_CONTROL &controls)
 {
-    JOB_CONTROL &controls = cheby.CONTROLS;
-    FRAME &system = cheby.SYSTEM;
-    NEIGHBORS &nlist = cheby.NEIGHBOR_LIST;
-    vector<PAIRS> &ff = cheby.FF_2BODY;
-    double perm_scale = nlist.PERM_SCALE[3];
+    const int nall = system.ALL_ATOMS;
+    std::vector<double> coords(nall * 3);
+    std::vector<int> parent(nall), atype_idx(nall);
 
-    vector<int> atom_type_index(3);
-    XYZ rab[3];
-    int natoms = system.ATOMS;
-
-    for (int a1 = 0; a1 < natoms; a1++) {
-        for (size_t a2idx = 0; a2idx < nlist.LIST_3B[a1].size(); a2idx++) {
-            int a2 = nlist.LIST_3B[a1][a2idx];
-            for (size_t a3idx = 0; a3idx < nlist.LIST_3B[a1].size(); a3idx++) {
-                int a3 = nlist.LIST_3B[a1][a3idx];
-                if (a3 == a2) continue;
-                if (perm_scale == 1.0 && system.PARENT[a2] > system.PARENT[a3])
-                    continue;
-
-                atom_type_index[0] = system.get_atomtype_idx(a1);
-                atom_type_index[1] = system.get_atomtype_idx(a2);
-                atom_type_index[2] = system.get_atomtype_idx(a3);
-                int tidx = trips.make_id_int(atom_type_index);
-                int trip_idx = trips.INT_MAP[tidx];
-                if (trip_idx < 0) continue;
-
-                TRIPLETS &cl = trips.VEC[trip_idx];
-                int pt_ij = pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a1, a2);
-                int pt_ik = pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a1, a3);
-                int pt_jk = pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a2, a3);
-
-                double rlen[3];
-                rlen[0] = get_dist(system, rab[0], a1, a2);
-                rlen[1] = get_dist(system, rab[1], a1, a3);
-                rlen[2] = get_dist(system, rab[2], a2, a3);
-
-                int pi[3] = {
-                    trips.PAIR_INDICES[tidx][0],
-                    trips.PAIR_INDICES[tidx][1],
-                    trips.PAIR_INDICES[tidx][2]
-                };
-
-                if (!cl.FORCE_CUTOFF.PROCEED(rlen[0], cl.S_MINIM[pi[0]], cl.S_MAXIM[pi[0]]))
-                    continue;
-                if (!cl.FORCE_CUTOFF.PROCEED(rlen[1], cl.S_MINIM[pi[1]], cl.S_MAXIM[pi[1]]))
-                    continue;
-                if (!cl.FORCE_CUTOFF.PROCEED(rlen[2], cl.S_MINIM[pi[2]], cl.S_MAXIM[pi[2]]))
-                    continue;
-
-                if (cl.MIN_FOUND[0] == -1) {
-                    cl.MIN_FOUND[pi[0]] = rlen[0];
-                    cl.MIN_FOUND[pi[1]] = rlen[1];
-                    cl.MIN_FOUND[pi[2]] = rlen[2];
-                } else {
-                    if (rlen[0] < cl.MIN_FOUND[pi[0]]) cl.MIN_FOUND[pi[0]] = rlen[0];
-                    if (rlen[1] < cl.MIN_FOUND[pi[1]]) cl.MIN_FOUND[pi[1]] = rlen[1];
-                    if (rlen[2] < cl.MIN_FOUND[pi[2]]) cl.MIN_FOUND[pi[2]] = rlen[2];
-                }
-                cl.N_CFG_CONTRIB++;
-
-                LSQTripGpu tr = {};
-                tr.a1 = a1;
-                tr.a2 = system.PARENT[a2];
-                tr.a3 = system.PARENT[a3];
-                tr.cluster_idx = trip_idx;
-                for (int k = 0; k < 3; k++) {
-                    tr.pair_index[k] = pi[k];
-                    tr.pt[k] = (k == 0) ? pt_ij : (k == 1) ? pt_ik : pt_jk;
-                    tr.rlen[k] = rlen[k];
-                    tr.lambda[k] = ff[tr.pt[k]].LAMBDA;
-                    tr.cheby_type[k] = cheby_type_to_int(ff[tr.pt[k]].CHEBY_TYPE);
-                    tr.snum[k] = ff[tr.pt[k]].SNUM_3B_CHEBY;
-                    tr.rab[k*3+0] = rab[k].X;
-                    tr.rab[k*3+1] = rab[k].Y;
-                    tr.rab[k*3+2] = rab[k].Z;
-                }
-                out.push_back(tr);
-            }
+    if (system.ATOMS == system.ALL_ATOMS) {
+        for (int i = 0; i < nall; i++) {
+            coords[i * 3 + 0] = system.COORDS[i].X;
+            coords[i * 3 + 1] = system.COORDS[i].Y;
+            coords[i * 3 + 2] = system.COORDS[i].Z;
+        }
+    } else {
+        for (int i = 0; i < nall; i++) {
+            coords[i * 3 + 0] = system.ALL_COORDS[i].X;
+            coords[i * 3 + 1] = system.ALL_COORDS[i].Y;
+            coords[i * 3 + 2] = system.ALL_COORDS[i].Z;
         }
     }
+    for (int i = 0; i < nall; i++) {
+        parent[i] = system.PARENT[i];
+        atype_idx[i] = system.ATOMTYPE_IDX[system.PARENT[i]];
+    }
+
+    LSQBoxGpu box = {};
+    for (int i = 0; i < 9; i++) {
+        box.hmat[i] = system.BOXDIM.HMAT[i];
+        box.invr_hmat[i] = system.BOXDIM.INVR_HMAT[i];
+    }
+
+    LSQFrameGpu frame = {};
+    frame.natoms = system.ATOMS;
+    frame.nall = nall;
+    frame.natmtyp = controls.NATMTYP;
+    frame.use_mic = (system.ATOMS == system.ALL_ATOMS) ? 1 : 0;
+    frame.rcut_2b = nlist.MAX_CUTOFF;
+    frame.rcut_3b = nlist.MAX_CUTOFF_3B;
+    frame.rcut_4b = nlist.MAX_CUTOFF_4B;
+    frame.rcut_pad = nlist.RCUT_PADDING;
+    frame.perm_2b = nlist.PERM_SCALE[2];
+    frame.perm_3b = nlist.PERM_SCALE[3];
+    frame.perm_4b = nlist.PERM_SCALE[4];
+
+    return lsq_gpu_upload_frame(coords.data(), nall, parent.data(), atype_idx.data(), &box, &frame);
 }
 
-static void build_quads(Cheby &cheby, CLUSTER_LIST &quads,
-                        std::vector<LSQQuadGpu> &out)
+// Cached static tables (pair params + cluster metadata + lookup maps)
+static std::vector<LSQPairParams> g_cached_pp;
+static std::vector<LSQClusterGpu> g_cached_trip_clusters, g_cached_quad_clusters;
+static std::vector<LSQPowerTermGpu> g_cached_trip_terms, g_cached_quad_terms;
+static std::vector<int> g_cached_ipm, g_cached_trip_map, g_cached_trip_pi;
+static std::vector<int> g_cached_quad_map, g_cached_quad_pi;
+static bool g_static_ready = false;
+static int g_cached_natmtyp = -1;
+
+static bool ensure_static_tables(Cheby &cheby, CLUSTER_LIST &trips, CLUSTER_LIST &quads)
 {
     JOB_CONTROL &controls = cheby.CONTROLS;
-    FRAME &system = cheby.SYSTEM;
-    NEIGHBORS &nlist = cheby.NEIGHBOR_LIST;
     vector<PAIRS> &ff = cheby.FF_2BODY;
-    double perm_scale = nlist.PERM_SCALE[4];
 
-    vector<int> atom_type_index(4);
-    XYZ rab[6];
-    int natoms = system.ATOMS;
+    if (g_static_ready && g_cached_natmtyp == controls.NATMTYP)
+        return true;
 
-    for (int a1 = 0; a1 < natoms; a1++) {
-        for (size_t a2idx = 0; a2idx < nlist.LIST_4B[a1].size(); a2idx++) {
-            int a2 = nlist.LIST_4B[a1][a2idx];
-            for (size_t a3idx = 0; a3idx < nlist.LIST_4B[a1].size(); a3idx++) {
-                int a3 = nlist.LIST_4B[a1][a3idx];
-                if (a3 == a2) continue;
-                if (perm_scale == 1.0 && system.PARENT[a2] > system.PARENT[a3])
-                    continue;
+    fill_pair_params(ff, g_cached_pp);
 
-                for (size_t a4idx = 0; a4idx < nlist.LIST_4B[a1].size(); a4idx++) {
-                    int a4 = nlist.LIST_4B[a1][a4idx];
-                    if (a2 == a4 || a3 == a4) continue;
-                    if (perm_scale == 1.0 && system.PARENT[a3] > system.PARENT[a4])
-                        continue;
+    g_cached_ipm.assign(LSQ_MAX_ATOM_TYPES2, 0);
+    for (size_t i = 0; i < cheby.INT_PAIR_MAP.size() && i < (size_t)LSQ_MAX_ATOM_TYPES2; i++)
+        g_cached_ipm[i] = cheby.INT_PAIR_MAP[i];
 
-                    atom_type_index[0] = system.get_atomtype_idx(a1);
-                    atom_type_index[1] = system.get_atomtype_idx(a2);
-                    atom_type_index[2] = system.get_atomtype_idx(a3);
-                    atom_type_index[3] = system.get_atomtype_idx(a4);
-                    int qid = quads.make_id_int(atom_type_index);
-                    int quad_idx = quads.INT_MAP[qid];
-                    if (quad_idx < 0) continue;
+    int n_2b = controls.TOT_SNUM;
+    int n_3b = controls.NUM_3B_CHEBY;
 
-                    QUADRUPLETS &cl = quads.VEC[quad_idx];
-                    int pt[6] = {
-                        pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a1, a2),
-                        pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a1, a3),
-                        pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a1, a4),
-                        pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a2, a3),
-                        pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a2, a4),
-                        pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a3, a4)
-                    };
+    g_cached_trip_clusters.clear(); g_cached_trip_terms.clear();
+    g_cached_quad_clusters.clear(); g_cached_quad_terms.clear();
 
-                    double rlen[6];
-                    rlen[0] = get_dist(system, rab[0], a1, a2);
-                    rlen[1] = get_dist(system, rab[1], a1, a3);
-                    rlen[2] = get_dist(system, rab[2], a1, a4);
-                    rlen[3] = get_dist(system, rab[3], a2, a3);
-                    rlen[4] = get_dist(system, rab[4], a2, a4);
-                    rlen[5] = get_dist(system, rab[5], a3, a4);
+    if (controls.USE_3B_CHEBY)
+        build_cluster_tables(trips, 3, n_2b, g_cached_trip_clusters, g_cached_trip_terms);
+    if (controls.USE_4B_CHEBY)
+        build_cluster_tables(quads, 6, n_2b + n_3b, g_cached_quad_clusters, g_cached_quad_terms);
 
-                    int pi[6];
-                    for (int f = 0; f < 6; f++)
-                        pi[f] = quads.PAIR_INDICES[qid][f];
+    fill_cluster_map(trips, LSQ_MAX_TRIP_MAP, 3, g_cached_trip_map, g_cached_trip_pi);
+    fill_cluster_map(quads, LSQ_MAX_QUAD_MAP, 6, g_cached_quad_map, g_cached_quad_pi);
 
-                    bool ok = true;
-                    for (int f = 0; f < 6; f++) {
-                        if (!cl.FORCE_CUTOFF.PROCEED(rlen[f], cl.S_MINIM[pi[f]], cl.S_MAXIM[pi[f]])) {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    if (!ok) continue;
+    if (!lsq_gpu_upload_static_tables(
+            controls.NATMTYP, (int)ff.size(),
+            g_cached_ipm.data(), g_cached_pp.data(),
+            controls.USE_3B_CHEBY ? 1 : 0,
+            g_cached_trip_map.data(), g_cached_trip_pi.data(),
+            (int)g_cached_trip_clusters.size(), g_cached_trip_clusters.data(),
+            (int)g_cached_trip_terms.size(), g_cached_trip_terms.data(),
+            controls.USE_4B_CHEBY ? 1 : 0,
+            g_cached_quad_map.data(), g_cached_quad_pi.data(),
+            (int)g_cached_quad_clusters.size(), g_cached_quad_clusters.data(),
+            (int)g_cached_quad_terms.size(), g_cached_quad_terms.data()))
+        return false;
 
-                    if (cl.MIN_FOUND[0] == -1) {
-                        for (int f = 0; f < 6; f++)
-                            cl.MIN_FOUND[pi[f]] = rlen[f];
-                    } else {
-                        for (int f = 0; f < 6; f++) {
-                            if (rlen[f] < cl.MIN_FOUND[pi[f]])
-                                cl.MIN_FOUND[pi[f]] = rlen[f];
-                        }
-                    }
-                    cl.N_CFG_CONTRIB++;
-
-                    LSQQuadGpu qd = {};
-                    qd.a1 = a1;
-                    qd.a2 = system.PARENT[a2];
-                    qd.a3 = system.PARENT[a3];
-                    qd.a4 = system.PARENT[a4];
-                    qd.cluster_idx = quad_idx;
-                    for (int f = 0; f < 6; f++) {
-                        qd.pair_index[f] = pi[f];
-                        qd.pt[f] = pt[f];
-                        qd.rlen[f] = rlen[f];
-                        qd.lambda[f] = ff[pt[f]].LAMBDA;
-                        qd.cheby_type[f] = cheby_type_to_int(ff[pt[f]].CHEBY_TYPE);
-                        qd.snum[f] = ff[pt[f]].SNUM_4B_CHEBY;
-                        qd.rab[f*3+0] = rab[f].X;
-                        qd.rab[f*3+1] = rab[f].Y;
-                        qd.rab[f*3+2] = rab[f].Z;
-                    }
-                    out.push_back(qd);
-                }
-            }
-        }
-    }
-}
-
-static void build_2b_pairs(Cheby &cheby, std::vector<int> &h_a1,
-                           std::vector<int> &h_a2, std::vector<int> &h_ptype,
-                           std::vector<double> &h_rlen, std::vector<double> &h_rab)
-{
-    JOB_CONTROL &controls = cheby.CONTROLS;
-    FRAME &system = cheby.SYSTEM;
-    NEIGHBORS &nlist = cheby.NEIGHBOR_LIST;
-    vector<PAIRS> &ff = cheby.FF_2BODY;
-    XYZ rab;
-
-    for (int a1 = 0; a1 < system.ATOMS; a1++) {
-        for (size_t a2idx = 0; a2idx < nlist.LIST[a1].size(); a2idx++) {
-            int a2 = nlist.LIST[a1][a2idx];
-            int pt = pair_type_idx(system, controls, cheby.INT_PAIR_MAP, a1, a2);
-            double rlen = get_dist(system, rab, a1, a2);
-
-            if (rlen < ff[pt].MIN_FOUND_DIST)
-                ff[pt].MIN_FOUND_DIST = rlen;
-
-            if (rlen > ff[pt].S_MINIM && rlen < ff[pt].S_MAXIM) {
-                ff[pt].N_CFG_CONTRIB++;
-                h_a1.push_back(a1);
-                h_a2.push_back(system.PARENT[a2]);
-                h_ptype.push_back(pt);
-                h_rlen.push_back(rlen);
-                h_rab.push_back(rab.X);
-                h_rab.push_back(rab.Y);
-                h_rab.push_back(rab.Z);
-            }
-        }
-    }
+    g_static_ready = true;
+    g_cached_natmtyp = controls.NATMTYP;
+    return true;
 }
 
 bool lsq_gpu_deriv_cheby(Cheby &cheby, A_MAT &a_matrix,
@@ -374,30 +266,8 @@ bool lsq_gpu_deriv_cheby(Cheby &cheby, A_MAT &a_matrix,
     if (controls.FIT_STRESS) fit_stress = 1;
     else if (controls.FIT_STRESS_ALL) fit_stress = 2;
 
-    int n_2b = controls.TOT_SNUM;
-    int n_3b = controls.NUM_3B_CHEBY;
-
-    std::vector<LSQPairParams> h_pp;
-    fill_pair_params(ff, h_pp);
-
-    std::vector<int> h_a1, h_a2, h_ptype;
-    std::vector<double> h_rlen, h_rab2;
-    if (ff[0].SNUM > 0)
-        build_2b_pairs(cheby, h_a1, h_a2, h_ptype, h_rlen, h_rab2);
-
-    std::vector<LSQClusterGpu> trip_clusters, quad_clusters;
-    std::vector<LSQPowerTermGpu> trip_terms, quad_terms;
-    if (controls.USE_3B_CHEBY)
-        build_cluster_tables(trips, 3, n_2b, trip_clusters, trip_terms);
-    if (controls.USE_4B_CHEBY)
-        build_cluster_tables(quads, 6, n_2b + n_3b, quad_clusters, quad_terms);
-
-    std::vector<LSQTripGpu> h_trips;
-    std::vector<LSQQuadGpu> h_quads;
-    if (controls.USE_3B_CHEBY)
-        build_trips(cheby, trips, h_trips);
-    if (controls.USE_4B_CHEBY)
-        build_quads(cheby, quads, h_quads);
+    if (!ensure_static_tables(cheby, trips, quads)) return false;
+    if (!upload_frame_geometry(system, nlist, controls)) return false;
 
     std::vector<double> h_fx(natoms * nparams, 0.0);
     std::vector<double> h_fy(natoms * nparams, 0.0);
@@ -408,33 +278,27 @@ bool lsq_gpu_deriv_cheby(Cheby &cheby, A_MAT &a_matrix,
 
     lsq_gpu_begin_frame_accum(nparams, natoms);
 
-    if (ff[0].SNUM > 0 && !h_a1.empty()) {
-        if (!lsq_gpu_launch_deriv_2b(
-                (int)h_a1.size(), nparams, natoms, (int)ff.size(),
-                h_a1.data(), h_a2.data(), h_ptype.data(),
-                h_rlen.data(), h_rab2.data(), h_pp.data(),
+    int npairs = 0, ntrips = 0, nquads = 0;
+
+    if (ff[0].SNUM > 0) {
+        if (!lsq_gpu_enumerate_2b(&npairs)) return false;
+        if (!lsq_gpu_launch_deriv_2b_device(npairs, nparams, natoms,
                 nlist.PERM_SCALE[2], cheby.DERIV_CONST, fit_stress,
                 controls.FIT_ENER ? 1 : 0))
             return false;
     }
 
-    if (controls.USE_3B_CHEBY && !h_trips.empty()) {
-        if (!lsq_gpu_launch_deriv_3b(
-                (int)h_trips.size(), nparams, natoms,
-                h_trips.data(),
-                trip_clusters.data(), (int)trip_clusters.size(),
-                trip_terms.data(), (int)trip_terms.size(),
+    if (controls.USE_3B_CHEBY) {
+        if (!lsq_gpu_enumerate_3b(&ntrips)) return false;
+        if (!lsq_gpu_launch_deriv_3b_device(ntrips, nparams, natoms,
                 nlist.PERM_SCALE[3], cheby.DERIV_CONST, fit_stress,
                 controls.FIT_ENER ? 1 : 0))
             return false;
     }
 
-    if (controls.USE_4B_CHEBY && !h_quads.empty()) {
-        if (!lsq_gpu_launch_deriv_4b(
-                (int)h_quads.size(), nparams, natoms,
-                h_quads.data(),
-                quad_clusters.data(), (int)quad_clusters.size(),
-                quad_terms.data(), (int)quad_terms.size(),
+    if (controls.USE_4B_CHEBY) {
+        if (!lsq_gpu_enumerate_4b(&nquads)) return false;
+        if (!lsq_gpu_launch_deriv_4b_device(nquads, nparams, natoms,
                 nlist.PERM_SCALE[4], cheby.DERIV_CONST, fit_stress,
                 controls.FIT_ENER ? 1 : 0))
             return false;

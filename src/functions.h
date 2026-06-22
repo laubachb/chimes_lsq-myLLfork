@@ -150,8 +150,9 @@ public:
 	string TRAJ_FORMAT;	      // .gen, .xyzf, or .lammps (currently)
 	bool   SPLIT_FILES ;	      // If TRUE, do not concatenate A matrix files for LSQ.
 	bool   BINARY_A ;             // If TRUE, write A matrix rows as binary doubles (A.NNNN.bin).
-	bool   USE_GPU ;              // If TRUE, use GPU for 2-body derivative accumulation when built with CUDA.
-	int    GPU_BATCH_FRAMES ;     // Reserved: batch multiple frames per GPU launch (1 = one frame at a time).
+	bool   TEXT_A ;               // If TRUE, write A matrix as text (default). May disable when BINARY_A only.
+	bool   USE_GPU ;              // If TRUE, use GPU for Chebyshev derivative accumulation when built with CUDA.
+	int    GPU_BATCH_FRAMES ;     // CUDA sync batching interval (1 = every frame).
 	bool   HIERARCHICAL_FIT;      // If true, allows 2-body and 1-body interctions to be excluded from fitting
 	int    FREQ_BACKUP;	      // How often to write backup files for restart.
 	bool   PRINT_VELOC;	      // If true, write out the velocities 
@@ -250,6 +251,7 @@ public:
 		USE_4B_CHEBY = false;	//If true, calculate 4-Body Chebyshev interaction.
 		SPLIT_FILES  = false ;
 		BINARY_A     = false ;
+		TEXT_A       = true ;
 		USE_GPU      = false ;
 		GPU_BATCH_FRAMES = 1 ;
 		TOT_ALL_PARAMS = 0 ;

@@ -5,8 +5,35 @@
 #define LSQ_MAX_POLY_ORDER 24
 #define LSQ_MAX_CLUSTER_PAIRS 6
 
+// Must match MAX_ATOM_TYPES in functions.h
+#define LSQ_MAX_ATOM_TYPES 10
+#define LSQ_MAX_ATOM_TYPES2 (LSQ_MAX_ATOM_TYPES * LSQ_MAX_ATOM_TYPES)
+#define LSQ_MAX_TRIP_MAP   (LSQ_MAX_ATOM_TYPES * LSQ_MAX_ATOM_TYPES * LSQ_MAX_ATOM_TYPES)
+#define LSQ_MAX_QUAD_MAP   (LSQ_MAX_TRIP_MAP * LSQ_MAX_ATOM_TYPES)
+
+struct LSQBoxGpu {
+    double hmat[9];
+    double invr_hmat[9];
+};
+
+struct LSQFrameGpu {
+    int    natoms;
+    int    nall;
+    int    natmtyp;
+    int    use_mic;          // natoms == nall
+    double rcut_2b;
+    double rcut_3b;
+    double rcut_4b;
+    double rcut_pad;
+    double perm_2b;
+    double perm_3b;
+    double perm_4b;
+};
+
 struct LSQPairParams {
     int    snum;
+    int    snum_3b;
+    int    snum_4b;
     int    vstart;
     double s_minim;
     double s_maxim;
@@ -95,5 +122,42 @@ bool lsq_gpu_finish_frame_accum(
     double *h_stress_xx, double *h_stress_xy, double *h_stress_xz,
     double *h_stress_yy, double *h_stress_yz, double *h_stress_zz,
     double *h_frame_energies);
+
+// Tier-1 pipeline: static cache, GPU neighbor enumeration, batched sync
+void lsq_gpu_set_batch_frames(int n);
+int  lsq_gpu_batch_frames();
+void lsq_gpu_flush_batch();
+
+bool lsq_gpu_upload_static_tables(
+    int natmtyp, int n_pair_types,
+    const int *h_ipm,
+    const LSQPairParams *h_pair_params,
+    int use_3b, const int *h_trip_map, const int *h_trip_pair_idx,
+    int n_trip_clusters, const LSQClusterGpu *h_trip_clusters,
+    int n_trip_terms, const LSQPowerTermGpu *h_trip_terms,
+    int use_4b, const int *h_quad_map, const int *h_quad_pair_idx,
+    int n_quad_clusters, const LSQClusterGpu *h_quad_clusters,
+    int n_quad_terms, const LSQPowerTermGpu *h_quad_terms);
+
+bool lsq_gpu_upload_frame(
+    const double *h_coords, int nall,
+    const int *h_parent, const int *h_atom_type_idx,
+    const LSQBoxGpu *box, const LSQFrameGpu *frame);
+
+bool lsq_gpu_enumerate_2b(int *out_npairs);
+bool lsq_gpu_enumerate_3b(int *out_ntrips);
+bool lsq_gpu_enumerate_4b(int *out_nquads);
+
+bool lsq_gpu_launch_deriv_2b_device(
+    int npairs, int nparams, int natoms,
+    double perm_scale, double deriv_const, int fit_stress, int fit_energy);
+
+bool lsq_gpu_launch_deriv_3b_device(
+    int ntrips, int nparams, int natoms,
+    double perm_scale, double deriv_const, int fit_stress, int fit_energy);
+
+bool lsq_gpu_launch_deriv_4b_device(
+    int nquads, int nparams, int natoms,
+    double perm_scale, double deriv_const, int fit_stress, int fit_energy);
 
 #endif

@@ -47,6 +47,7 @@ class A_MAT
 
 	ofstream fileA, fileb, fileb_labeled, filena;
 	ofstream fileAbin;              // optional binary A rows (see BINARY_A)
+	bool text_a_output;             // write A.NNNN.txt rows when true
 	
 	bool			DO_EXCLUDE_1B;	// Are 1-body interactions being excluded?
 	bool			DO_EXCLUDE_2B;	// Are 2-body interactions being excluded?
@@ -80,6 +81,7 @@ class A_MAT
 	void push_A_col(double v);
 	void end_A_row();
 	void write_natoms(ofstream & OUTFILE);
+	void write_stress_row(const struct JOB_CONTROL &CONTROLS, bool DO_ENER, double STENSOR::*comp);
 	int data_count;
 	int param_count;
 	vector<double> a_row_buf;
