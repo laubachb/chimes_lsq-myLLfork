@@ -12,6 +12,7 @@ Optional CUDA support speeds up the Chebyshev derivative step that builds the de
 | MPI rank → GPU device mapping | Implemented |
 | GPU neighbor enumeration (fused 2B/3B/4B) | Implemented |
 | Static device table cache | Implemented |
+| Inner-cutoff Cheby fixes (`ZERO_DERIV`, `CONSTANT_DERIV`, `SMOOTH`) | Implemented |
 | Binary A-matrix output (force/stress/energy rows) | Implemented |
 | CPU fallback for unsupported cases | Implemented |
 | Multi-frame device batching (single D2H) | Not implemented |
@@ -19,7 +20,7 @@ Optional CUDA support speeds up the Chebyshev derivative step that builds the de
 | Binary A reader in `chimes_lsq.py` | Not implemented |
 | CI / automated GPU validation | Not implemented |
 
-Last updated: 2025-06 (branch `laubachb/gpu-acceleartion`).
+Last updated: 2026-06 (branch `laubachb/gpu-acceleartion`).
 
 ## Build
 
@@ -48,7 +49,7 @@ GPU use is **opt-in**. Default installs behave exactly as before.
 
 ```
 # USEGPU # true
-# BINARYA # true    # optional: write A.NNNN.bin (force rows only)
+# BINARYA # true    # optional: write A.NNNN.bin
 ```
 
 ### Environment overrides
@@ -116,20 +117,19 @@ Kernels mirror CPU `Cheby::Deriv_2B`, `Deriv_3B`, and `Deriv_4B` (cluster cutoff
 - Any 2B/3B/4B polynomial order exceeds `LSQ_MAX_POLY_ORDER` (24 in `chimes_lsq_gpu_types.h`)
 - A CUDA launch or memcpy fails
 
-**Gap:** inner-cutoff `cheby_fix_type` smoothing (`ZERO_DERIV`, `CONSTANT_DERIV`, `SMOOTH`) is applied on CPU but **not** in GPU kernels. Fits that rely on non-default inner-cutoff derivative fixes may disagree with GPU results until this is implemented.
+Inner-cutoff `cheby_fix_type` handling (`ZERO_DERIV`, `CONSTANT_DERIV`, `SMOOTH`) is mirrored in GPU polynomial evaluation for many-body cutoffs.
 
 ## Tech debt / follow-ups
 
 Track these when extending or reviewing the GPU path:
 
-1. **Inner-cutoff Cheby fixes** — Port `Cheby::cheby_fix` logic into GPU `set_polys` / derivative evaluation.
-2. **True multi-frame device batching** — accumulate N frames on GPU before host download (needs per-frame device buffers).
-3. **Binary A reader** — `chimes_lsq.py` / DLASSO do not read `A.NNNN.bin` yet.
-4. **Host-side caching** — static tables cached on device; coords still uploaded per frame.
-5. **Polynomial order cap** — Raise or remove `LSQ_MAX_POLY_ORDER` (affects GPU stack arrays in 4B kernel).
-6. **Automated testing** — Add GPU-node job to CI or document a manual release checklist; extend `gpu_validate.sh` for 4B and stress/energy fits.
-7. **Performance profiling** — Measure PCIe transfer vs kernel time; consider persistent device buffers and CUDA graphs for production campaigns.
-8. **Documentation sync** — Keep this file, `doc/source/gpu_acceleration.rst`, and the PR description aligned when behavior changes.
+1. **True multi-frame device batching** — accumulate N frames on GPU before host download (needs per-frame device buffers).
+2. **Binary A reader** — `chimes_lsq.py` / DLASSO do not read `A.NNNN.bin` yet.
+3. **Host-side caching** — static tables cached on device; coords still uploaded per frame.
+4. **Polynomial order cap** — Raise or remove `LSQ_MAX_POLY_ORDER` (affects GPU stack arrays in 4B kernel).
+5. **Automated testing** — Add GPU-node job to CI or document a manual release checklist; extend `gpu_validate.sh` for 4B and stress/energy fits.
+6. **Performance profiling** — Measure PCIe transfer vs kernel time; consider persistent device buffers and CUDA graphs for production campaigns.
+7. **Documentation sync** — Keep this file, `doc/source/gpu_acceleration.rst`, and the PR description aligned when behavior changes.
 
 ## File index
 

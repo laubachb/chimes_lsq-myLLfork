@@ -56,8 +56,8 @@ This compares CPU and GPU ``A``/``b`` outputs for a 2B+3B test case.
 Limitations
 -----------
 
-The GPU path is not used when ``HIERARCHICAL_FIT`` or ``FITCOUL`` is enabled, when polynomial orders exceed 24, or when CUDA is unavailable. Inner-cutoff Chebyshev derivative fixes (``cheby_fix_type``) are not yet implemented on the GPU.
+The GPU path is not used when ``HIERARCHICAL_FIT`` or ``FITCOUL`` is enabled, when polynomial orders exceed 24, or when CUDA is unavailable. Inner-cutoff Chebyshev derivative fixes (``ZERO_DERIV``, ``CONSTANT_DERIV``, and ``SMOOTH``) are mirrored on the GPU.
 
-Binary ``A`` output covers force rows only; the Python solver still expects text ``A.*.txt``.
+Binary ``A`` output writes the generated ``A`` rows as doubles; the Python solver still expects text ``A.*.txt``.
 
 For the full implementation status and tech-debt checklist, see ``doc/GPU_ACCELERATION.md`` in the repository.

@@ -831,11 +831,24 @@ static int process_frame(	A_MAT &A_MATRIX,
 	 }		
 	 NEIGHBOR_LIST.INITIALIZE(SYSTEM, NEIGHBOR_PADDING);
 #ifdef USE_CUDA
-	 if (CONTROLS.USE_GPU) {
-		 NEIGHBOR_LIST.PERM_SCALE[0] = 1.0;
-		 NEIGHBOR_LIST.PERM_SCALE[1] = 1.0;
-		 for (size_t j = 2; j < NEIGHBOR_LIST.PERM_SCALE.size(); j++)
-			 NEIGHBOR_LIST.PERM_SCALE[j] = NEIGHBOR_LIST.PERM_SCALE[j - 1] / (double)j;
+	 bool gpu_can_own_derivatives =
+		 CONTROLS.USE_GPU &&
+		 !CONTROLS.FIT_COUL &&
+		 !CONTROLS.HIERARCHICAL_FIT &&
+		 !ATOM_PAIRS.empty() &&
+		 ATOM_PAIRS[0].PAIRTYP == "CHEBYSHEV";
+
+	 if (gpu_can_own_derivatives) {
+		 SYSTEM.update_ghost(CONTROLS.N_LAYERS, true);
+		 if (NEIGHBOR_LIST.UPDATE_WITH_BIG && NEIGHBOR_LIST.USE) {
+			 for (size_t j = 0; j < NEIGHBOR_LIST.PERM_SCALE.size(); j++)
+				 NEIGHBOR_LIST.PERM_SCALE[j] = 1.0;
+		 } else {
+			 NEIGHBOR_LIST.PERM_SCALE[0] = 1.0;
+			 NEIGHBOR_LIST.PERM_SCALE[1] = 1.0;
+			 for (size_t j = 2; j < NEIGHBOR_LIST.PERM_SCALE.size(); j++)
+				 NEIGHBOR_LIST.PERM_SCALE[j] = NEIGHBOR_LIST.PERM_SCALE[j - 1] / (double)j;
+		 }
 	 } else
 #endif
 	 NEIGHBOR_LIST.DO_UPDATE (SYSTEM, CONTROLS);

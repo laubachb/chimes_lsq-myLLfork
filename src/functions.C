@@ -783,8 +783,12 @@ void ZCalc_Deriv (JOB_CONTROL & CONTROLS, vector<PAIRS> & FF_2BODY,  CLUSTER_LIS
 	  Cheby cheby{CONTROLS,FRAME_SYSTEM,NEIGHBOR_LIST,FF_2BODY,INT_PAIR_MAP} ;
 
 #ifdef USE_CUDA
-	  if (CONTROLS.USE_GPU && lsq_gpu_deriv_cheby(cheby, A_MATRIX, TRIPS, QUADS))
-		  return;
+	  if (CONTROLS.USE_GPU) {
+		  if (lsq_gpu_deriv_cheby(cheby, A_MATRIX, TRIPS, QUADS))
+			  return;
+
+		  NEIGHBOR_LIST.DO_UPDATE(FRAME_SYSTEM, CONTROLS);
+	  }
 #endif
 
 	  if ( FF_2BODY[0].SNUM > 0)
@@ -1356,5 +1360,4 @@ static void ZCalc_Serial_Chimes(FRAME &SYSTEM, PAIR_FF &FF_2BODY)
             + SYSTEM.PRESSURE_TENSORS_XYZ_ALL[2].Z ;
     }
 }
-
 

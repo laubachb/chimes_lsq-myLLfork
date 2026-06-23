@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <climits>
 
 #define MAX_POLY_ORDER LSQ_MAX_POLY_ORDER
 #define CUDA_CHECK(call) do {                                                   \
@@ -65,6 +66,15 @@ struct LSQGpuState {
 
 static LSQGpuState g_gpu = {};
 
+template <typename T>
+static void free_device_ptr(T *&ptr)
+{
+    if (ptr) {
+        cudaFree(ptr);
+        ptr = nullptr;
+    }
+}
+
 __device__ static void lsq_transform(double rlen, double x_diff, double x_avg,
                                      double lambda, int cheby_type,
                                      double &x, double &exprlen)
@@ -95,10 +105,10 @@ __device__ static double lsq_dx_dr(double xdiff, double rlen, double lambda,
     }
 }
 
-__device__ static void lsq_set_polys_edge(double rlen, double x_diff, double x_avg,
-                                        double lambda, int cheby_type, int snum,
-                                        double deriv_const,
-                                        double *Tn, double *Tnd)
+__device__ static void lsq_set_polys_regular(double rlen, double x_diff, double x_avg,
+                                             double lambda, int cheby_type, int snum,
+                                             double deriv_const,
+                                             double *Tn, double *Tnd)
 {
     double x = 0.0, exprlen = 0.0;
     lsq_transform(rlen, x_diff, x_avg, lambda, cheby_type, x, exprlen);
@@ -115,6 +125,50 @@ __device__ static void lsq_set_polys_edge(double rlen, double x_diff, double x_a
     for (int i = snum; i >= 1; i--)
         Tnd[i] = i * dx_dr * Tnd[i-1];
     Tnd[0] = 0.0;
+}
+
+__device__ static void lsq_set_polys_edge(double rlen, double x_diff, double x_avg,
+                                          double lambda, int cheby_type, int snum,
+                                          double deriv_const, double s_minim,
+                                          int cheby_fix_type, double smooth_distance,
+                                          double *Tn, double *Tnd)
+{
+    if (rlen >= s_minim) {
+        lsq_set_polys_regular(rlen, x_diff, x_avg, lambda, cheby_type,
+                              snum, deriv_const, Tn, Tnd);
+        return;
+    }
+
+    if (cheby_fix_type == 0) {
+        double x = 0.0, exprlen = 0.0;
+        lsq_transform(s_minim, x_diff, x_avg, lambda, cheby_type, x, exprlen);
+        (void)exprlen;
+
+        Tn[0] = 1.0;
+        Tn[1] = x;
+        Tnd[0] = 0.0;
+        Tnd[1] = 0.0;
+        for (int i = 2; i <= snum; i++) {
+            Tn[i] = 2.0 * x * Tn[i-1] - Tn[i-2];
+            Tnd[i] = 0.0;
+        }
+        return;
+    }
+
+    lsq_set_polys_regular(s_minim, x_diff, x_avg, lambda, cheby_type,
+                          snum, deriv_const, Tn, Tnd);
+
+    if (cheby_fix_type == 1) {
+        for (int i = 0; i <= snum; i++)
+            Tn[i] += Tnd[i] * (rlen - s_minim);
+        return;
+    }
+
+    double damp_fac = exp((rlen - s_minim) / smooth_distance);
+    for (int i = 0; i <= snum; i++) {
+        Tn[i] += smooth_distance * (damp_fac - 1.0) * Tnd[i];
+        Tnd[i] *= damp_fac;
+    }
 }
 
 __device__ static void lsq_fcut_edge(double rlen, double rmin, double rmax,
@@ -194,6 +248,7 @@ __global__ void kDeriv2B(int npairs,
                          const LSQPairParams *pair_params,
                          int nparams, int natoms,
                          double perm_scale, double deriv_const,
+                         int cheby_fix_type, double cheby_smooth_distance,
                          int fit_stress, int fit_energy,
                          double *fx, double *fy, double *fz,
                          double *sxx, double *sxy, double *sxz,
@@ -210,7 +265,8 @@ __global__ void kDeriv2B(int npairs,
 
     double Tn[MAX_POLY_ORDER + 1], Tnd[MAX_POLY_ORDER + 1];
     lsq_set_polys_edge(rlen, pp.x_diff, pp.x_avg, pp.lambda, pp.cheby_type,
-                       pp.snum, deriv_const, Tn, Tnd);
+                       pp.snum, deriv_const, pp.s_minim, cheby_fix_type,
+                       cheby_smooth_distance, Tn, Tnd);
 
     double fcut, fcutderiv;
     lsq_fcut_edge(rlen, pp.s_minim, pp.s_maxim, pp.fcut_type, pp.fcut_power,
@@ -235,6 +291,7 @@ __global__ void kDeriv3B(int ntrips,
                          const LSQPowerTermGpu *power_terms,
                          int nparams, int natoms,
                          double perm_scale, double deriv_const,
+                         int cheby_fix_type, double cheby_smooth_distance,
                          int fit_stress, int fit_energy,
                          double *fx, double *fy, double *fz,
                          double *sxx, double *sxy, double *sxz,
@@ -260,7 +317,8 @@ __global__ void kDeriv3B(int ntrips,
         int pi = tr.pair_index[e];
         lsq_set_polys_edge(tr.rlen[e], cl.x_diff[pi], cl.x_avg[pi],
                            tr.lambda[e], tr.cheby_type[e], tr.snum[e],
-                           deriv_const, Tn[e], Tnd[e]);
+                           deriv_const, cl.s_minim[pi], cheby_fix_type,
+                           cheby_smooth_distance, Tn[e], Tnd[e]);
         lsq_fcut_edge(tr.rlen[e], cl.s_minim[pi], cl.s_maxim[pi],
                       cl.fcut_type, cl.fcut_power, cl.fcut_offset,
                       fcut[e], fcutd[e]);
@@ -307,6 +365,7 @@ __global__ void kDeriv4B(int nquads,
                          const LSQPowerTermGpu *power_terms,
                          int nparams, int natoms,
                          double perm_scale, double deriv_const,
+                         int cheby_fix_type, double cheby_smooth_distance,
                          int fit_stress, int fit_energy,
                          double *fx, double *fy, double *fz,
                          double *sxx, double *sxy, double *sxz,
@@ -332,7 +391,8 @@ __global__ void kDeriv4B(int nquads,
         int pi = qd.pair_index[e];
         lsq_set_polys_edge(qd.rlen[e], cl.x_diff[pi], cl.x_avg[pi],
                            qd.lambda[e], qd.cheby_type[e], qd.snum[e],
-                           deriv_const, Tn[e], Tnd[e]);
+                           deriv_const, cl.s_minim[pi], cheby_fix_type,
+                           cheby_smooth_distance, Tn[e], Tnd[e]);
         lsq_fcut_edge(qd.rlen[e], cl.s_minim[pi], cl.s_maxim[pi],
                       cl.fcut_type, cl.fcut_power, cl.fcut_offset,
                       fcut[e], fcutd[e]);
@@ -425,15 +485,16 @@ __global__ void kEnum2B(const double *coords, const int *parent, const int *atyp
                         int *o_a1, int *o_a2, int *o_pt, double *o_rlen, double *o_rab,
                         unsigned int *counter, int cap)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     int nall = frame.nall;
     int natoms = frame.natoms;
-    int jobs = natoms * nall;
+    long long jobs = (long long)natoms * nall;
     if (tid >= jobs) return;
 
-    int a1 = tid / nall;
-    int a2 = tid % nall;
+    int a1 = (int)(tid / nall);
+    int a2 = (int)(tid % nall);
     if (a2 == a1) return;
+    if (frame.perm_2b == 1.0 && a1 > parent[a2]) return;
 
     double rx, ry, rz, rlen;
     lsq_get_dist(coords, &box, a1, a2, frame.use_mic, rx, ry, rz, rlen);
@@ -463,17 +524,18 @@ __global__ void kEnum3B(const double *coords, const int *parent, const int *atyp
                         LSQBoxGpu box, LSQFrameGpu frame,
                         LSQTripGpu *out, unsigned int *counter, int cap)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     int nall = frame.nall;
     int natoms = frame.natoms;
     long long jobs = (long long)natoms * nall * nall;
-    if ((long long)tid >= jobs) return;
+    if (tid >= jobs) return;
 
-    int a1 = tid / (nall * nall);
-    int rem = tid % (nall * nall);
-    int a2 = rem / nall;
-    int a3 = rem % nall;
+    int a1 = (int)(tid / ((long long)nall * nall));
+    long long rem = tid % ((long long)nall * nall);
+    int a2 = (int)(rem / nall);
+    int a3 = (int)(rem % nall);
     if (a2 == a1 || a3 == a1 || a3 == a2) return;
+    if (frame.perm_3b == 1.0 && (a1 > parent[a2] || a1 > parent[a3])) return;
     if (frame.perm_3b == 1.0 && parent[a2] > parent[a3]) return;
 
     double rlen[3], rab[9];
@@ -532,7 +594,7 @@ __global__ void kEnum4B(const double *coords, const int *parent, const int *atyp
                         LSQBoxGpu box, LSQFrameGpu frame,
                         LSQQuadGpu *out, unsigned int *counter, int cap)
 {
-    long long tid = blockIdx.x * blockDim.x + threadIdx.x;
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     int nall = frame.nall;
     int natoms = frame.natoms;
     long long cube = (long long)nall * nall * nall;
@@ -541,12 +603,14 @@ __global__ void kEnum4B(const double *coords, const int *parent, const int *atyp
 
     int a1 = (int)(tid / cube);
     long long rem = tid % cube;
-    int a2 = (int)(rem / (nall * nall));
-    rem = rem % (nall * nall);
+    int a2 = (int)(rem / ((long long)nall * nall));
+    rem = rem % ((long long)nall * nall);
     int a3 = (int)(rem / nall);
     int a4 = (int)(rem % nall);
 
     if (a2 == a1 || a3 == a1 || a4 == a1 || a3 == a2 || a4 == a2 || a4 == a3) return;
+    if (frame.perm_4b == 1.0 &&
+        (a1 > parent[a2] || a1 > parent[a3] || a1 > parent[a4])) return;
     if (frame.perm_4b == 1.0 && parent[a2] > parent[a3]) return;
     if (frame.perm_4b == 1.0 && parent[a3] > parent[a4]) return;
 
@@ -609,16 +673,16 @@ static bool ensure_accum(int nparams, int natoms)
         g_gpu.d_fx && g_gpu.d_fy && g_gpu.d_fz)
         return true;
 
-    if (g_gpu.d_fx) cudaFree(g_gpu.d_fx);
-    if (g_gpu.d_fy) cudaFree(g_gpu.d_fy);
-    if (g_gpu.d_fz) cudaFree(g_gpu.d_fz);
-    if (g_gpu.d_stress_xx) cudaFree(g_gpu.d_stress_xx);
-    if (g_gpu.d_stress_xy) cudaFree(g_gpu.d_stress_xy);
-    if (g_gpu.d_stress_xz) cudaFree(g_gpu.d_stress_xz);
-    if (g_gpu.d_stress_yy) cudaFree(g_gpu.d_stress_yy);
-    if (g_gpu.d_stress_yz) cudaFree(g_gpu.d_stress_yz);
-    if (g_gpu.d_stress_zz) cudaFree(g_gpu.d_stress_zz);
-    if (g_gpu.d_frame_energies) cudaFree(g_gpu.d_frame_energies);
+    free_device_ptr(g_gpu.d_fx);
+    free_device_ptr(g_gpu.d_fy);
+    free_device_ptr(g_gpu.d_fz);
+    free_device_ptr(g_gpu.d_stress_xx);
+    free_device_ptr(g_gpu.d_stress_xy);
+    free_device_ptr(g_gpu.d_stress_xz);
+    free_device_ptr(g_gpu.d_stress_yy);
+    free_device_ptr(g_gpu.d_stress_yz);
+    free_device_ptr(g_gpu.d_stress_zz);
+    free_device_ptr(g_gpu.d_frame_energies);
 
     size_t fsize = (size_t)natoms * nparams;
     CUDA_CHECK(cudaMalloc(&g_gpu.d_fx, fsize * sizeof(double)));
@@ -639,12 +703,12 @@ static bool ensure_accum(int nparams, int natoms)
 static bool ensure_2b(int npairs, int n_pair_types)
 {
     if (g_gpu.max_pairs >= npairs && g_gpu.n_pair_types >= n_pair_types) return true;
-    if (g_gpu.d_a1) cudaFree(g_gpu.d_a1);
-    if (g_gpu.d_a2) cudaFree(g_gpu.d_a2);
-    if (g_gpu.d_ptype) cudaFree(g_gpu.d_ptype);
-    if (g_gpu.d_rlen) cudaFree(g_gpu.d_rlen);
-    if (g_gpu.d_rab) cudaFree(g_gpu.d_rab);
-    if (g_gpu.d_pair_params) cudaFree(g_gpu.d_pair_params);
+    free_device_ptr(g_gpu.d_a1);
+    free_device_ptr(g_gpu.d_a2);
+    free_device_ptr(g_gpu.d_ptype);
+    free_device_ptr(g_gpu.d_rlen);
+    free_device_ptr(g_gpu.d_rab);
+    free_device_ptr(g_gpu.d_pair_params);
     int cap = (npairs < 4096) ? 4096 : npairs;
     CUDA_CHECK(cudaMalloc(&g_gpu.d_a1, cap * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&g_gpu.d_a2, cap * sizeof(int)));
@@ -661,9 +725,9 @@ static bool ensure_3b(int ntrips, int n_clusters, int n_power_terms)
 {
     if (g_gpu.max_trips >= ntrips && g_gpu.n_trip_clusters >= n_clusters &&
         g_gpu.n_trip_power_terms >= n_power_terms) return true;
-    if (g_gpu.d_trips) cudaFree(g_gpu.d_trips);
-    if (g_gpu.d_trip_clusters) cudaFree(g_gpu.d_trip_clusters);
-    if (g_gpu.d_trip_power_terms) cudaFree(g_gpu.d_trip_power_terms);
+    free_device_ptr(g_gpu.d_trips);
+    free_device_ptr(g_gpu.d_trip_clusters);
+    free_device_ptr(g_gpu.d_trip_power_terms);
     int cap = (ntrips < 4096) ? 4096 : ntrips;
     CUDA_CHECK(cudaMalloc(&g_gpu.d_trips, cap * sizeof(LSQTripGpu)));
     CUDA_CHECK(cudaMalloc(&g_gpu.d_trip_clusters, n_clusters * sizeof(LSQClusterGpu)));
@@ -678,9 +742,9 @@ static bool ensure_4b(int nquads, int n_clusters, int n_power_terms)
 {
     if (g_gpu.max_quads >= nquads && g_gpu.n_quad_clusters >= n_clusters &&
         g_gpu.n_quad_power_terms >= n_power_terms) return true;
-    if (g_gpu.d_quads) cudaFree(g_gpu.d_quads);
-    if (g_gpu.d_quad_clusters) cudaFree(g_gpu.d_quad_clusters);
-    if (g_gpu.d_quad_power_terms) cudaFree(g_gpu.d_quad_power_terms);
+    free_device_ptr(g_gpu.d_quads);
+    free_device_ptr(g_gpu.d_quad_clusters);
+    free_device_ptr(g_gpu.d_quad_power_terms);
     int cap = (nquads < 4096) ? 4096 : nquads;
     CUDA_CHECK(cudaMalloc(&g_gpu.d_quads, cap * sizeof(LSQQuadGpu)));
     CUDA_CHECK(cudaMalloc(&g_gpu.d_quad_clusters, n_clusters * sizeof(LSQClusterGpu)));
@@ -701,6 +765,8 @@ void lsq_gpu_init(int device_id)
     g_gpu.device_id = device_id;
     g_gpu.batch_frames = 1;
     g_gpu.batch_pending = 0;
+    g_gpu.h_frame.cheby_fix_type = 2;
+    g_gpu.h_frame.cheby_smooth_distance = 0.01;
     g_gpu.initialized = true;
 }
 
@@ -756,21 +822,22 @@ void lsq_gpu_finalize()
 
 bool lsq_gpu_is_initialized() { return g_gpu.initialized; }
 
-void lsq_gpu_begin_frame_accum(int nparams, int natoms)
+bool lsq_gpu_begin_frame_accum(int nparams, int natoms)
 {
-    if (!g_gpu.initialized) return;
-    if (!ensure_accum(nparams, natoms)) return;
+    if (!g_gpu.initialized) return false;
+    if (!ensure_accum(nparams, natoms)) return false;
     size_t fsize = (size_t)natoms * nparams;
-    cudaMemset(g_gpu.d_fx, 0, fsize * sizeof(double));
-    cudaMemset(g_gpu.d_fy, 0, fsize * sizeof(double));
-    cudaMemset(g_gpu.d_fz, 0, fsize * sizeof(double));
-    cudaMemset(g_gpu.d_stress_xx, 0, nparams * sizeof(double));
-    cudaMemset(g_gpu.d_stress_xy, 0, nparams * sizeof(double));
-    cudaMemset(g_gpu.d_stress_xz, 0, nparams * sizeof(double));
-    cudaMemset(g_gpu.d_stress_yy, 0, nparams * sizeof(double));
-    cudaMemset(g_gpu.d_stress_yz, 0, nparams * sizeof(double));
-    cudaMemset(g_gpu.d_stress_zz, 0, nparams * sizeof(double));
-    cudaMemset(g_gpu.d_frame_energies, 0, nparams * sizeof(double));
+    CUDA_CHECK(cudaMemset(g_gpu.d_fx, 0, fsize * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_fy, 0, fsize * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_fz, 0, fsize * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_stress_xx, 0, nparams * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_stress_xy, 0, nparams * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_stress_xz, 0, nparams * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_stress_yy, 0, nparams * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_stress_yz, 0, nparams * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_stress_zz, 0, nparams * sizeof(double)));
+    CUDA_CHECK(cudaMemset(g_gpu.d_frame_energies, 0, nparams * sizeof(double)));
+    return true;
 }
 
 bool lsq_gpu_launch_deriv_2b(
@@ -798,7 +865,9 @@ bool lsq_gpu_launch_deriv_2b(
     int block = 256, grid = (npairs + block - 1) / block;
     kDeriv2B<<<grid, block>>>(npairs, g_gpu.d_a1, g_gpu.d_a2, g_gpu.d_ptype,
         g_gpu.d_rlen, g_gpu.d_rab, g_gpu.d_pair_params, nparams, natoms,
-        perm_scale, deriv_const, fit_stress, fit_energy,
+        perm_scale, deriv_const,
+        g_gpu.h_frame.cheby_fix_type, g_gpu.h_frame.cheby_smooth_distance,
+        fit_stress, fit_energy,
         g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
         g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
         g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
@@ -826,7 +895,9 @@ bool lsq_gpu_launch_deriv_3b(
 
     int block = 256, grid = (ntrips + block - 1) / block;
     kDeriv3B<<<grid, block>>>(ntrips, g_gpu.d_trips, g_gpu.d_trip_clusters, g_gpu.d_trip_power_terms,
-        nparams, natoms, perm_scale, deriv_const, fit_stress, fit_energy,
+        nparams, natoms, perm_scale, deriv_const,
+        g_gpu.h_frame.cheby_fix_type, g_gpu.h_frame.cheby_smooth_distance,
+        fit_stress, fit_energy,
         g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
         g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
         g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
@@ -854,7 +925,9 @@ bool lsq_gpu_launch_deriv_4b(
 
     int block = 256, grid = (nquads + block - 1) / block;
     kDeriv4B<<<grid, block>>>(nquads, g_gpu.d_quads, g_gpu.d_quad_clusters, g_gpu.d_quad_power_terms,
-        nparams, natoms, perm_scale, deriv_const, fit_stress, fit_energy,
+        nparams, natoms, perm_scale, deriv_const,
+        g_gpu.h_frame.cheby_fix_type, g_gpu.h_frame.cheby_smooth_distance,
+        fit_stress, fit_energy,
         g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
         g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
         g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
@@ -1001,11 +1074,25 @@ static bool read_enum_count(int cap, int *out_n)
 {
     unsigned int hcount = 0;
     CUDA_CHECK(cudaMemcpy(&hcount, g_gpu.d_enum_counter, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-    if ((int)hcount > cap) {
+    if (hcount > (unsigned int)cap) {
         fprintf(stderr, "GPU enum overflow: %u > %d (increase caps or reduce system)\n", hcount, cap);
         return false;
     }
     *out_n = (int)hcount;
+    return true;
+}
+
+static bool grid_for_jobs(long long jobs, int block, int *grid)
+{
+    if (jobs <= 0) {
+        *grid = 0;
+        return true;
+    }
+    if (jobs > (long long)INT_MAX * block) {
+        fprintf(stderr, "GPU enum job count too large: %lld\n", jobs);
+        return false;
+    }
+    *grid = (int)((jobs + block - 1) / block);
     return true;
 }
 
@@ -1018,8 +1105,10 @@ bool lsq_gpu_enumerate_2b(int *out_npairs)
 
     int nall = g_gpu.h_frame.nall;
     int natoms = g_gpu.h_frame.natoms;
-    int jobs = natoms * nall;
-    int block = 256, grid = (jobs + block - 1) / block;
+    long long jobs = (long long)natoms * nall;
+    int block = 256, grid = 0;
+    if (!grid_for_jobs(jobs, block, &grid)) return false;
+    if (grid == 0) { *out_npairs = 0; return true; }
     kEnum2B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
         g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.h_box, g_gpu.h_frame,
         g_gpu.d_a1, g_gpu.d_a2, g_gpu.d_ptype, g_gpu.d_rlen, g_gpu.d_rab,
@@ -1039,7 +1128,9 @@ bool lsq_gpu_enumerate_3b(int *out_ntrips)
     int natoms = g_gpu.h_frame.natoms;
     long long jobs = (long long)natoms * nall * nall;
     int block = 256;
-    int grid = (int)((jobs + block - 1) / block);
+    int grid = 0;
+    if (!grid_for_jobs(jobs, block, &grid)) return false;
+    if (grid == 0) { *out_ntrips = 0; return true; }
     kEnum3B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
         g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.d_trip_map, g_gpu.d_trip_pair_idx,
         g_gpu.d_trip_clusters, g_gpu.h_box, g_gpu.h_frame,
@@ -1060,7 +1151,9 @@ bool lsq_gpu_enumerate_4b(int *out_nquads)
     long long cube = (long long)nall * nall * nall;
     long long jobs = (long long)natoms * cube;
     int block = 256;
-    int grid = (int)((jobs + block - 1) / block);
+    int grid = 0;
+    if (!grid_for_jobs(jobs, block, &grid)) return false;
+    if (grid == 0) { *out_nquads = 0; return true; }
     kEnum4B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
         g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.d_quad_map, g_gpu.d_quad_pair_idx,
         g_gpu.d_quad_clusters, g_gpu.h_box, g_gpu.h_frame,
@@ -1077,7 +1170,9 @@ bool lsq_gpu_launch_deriv_2b_device(
     int block = 256, grid = (npairs + block - 1) / block;
     kDeriv2B<<<grid, block>>>(npairs, g_gpu.d_a1, g_gpu.d_a2, g_gpu.d_ptype,
         g_gpu.d_rlen, g_gpu.d_rab, g_gpu.d_pair_params, nparams, natoms,
-        perm_scale, deriv_const, fit_stress, fit_energy,
+        perm_scale, deriv_const,
+        g_gpu.h_frame.cheby_fix_type, g_gpu.h_frame.cheby_smooth_distance,
+        fit_stress, fit_energy,
         g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
         g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
         g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
@@ -1093,7 +1188,9 @@ bool lsq_gpu_launch_deriv_3b_device(
     if (!g_gpu.initialized || ntrips == 0) return true;
     int block = 256, grid = (ntrips + block - 1) / block;
     kDeriv3B<<<grid, block>>>(ntrips, g_gpu.d_trips, g_gpu.d_trip_clusters, g_gpu.d_trip_power_terms,
-        nparams, natoms, perm_scale, deriv_const, fit_stress, fit_energy,
+        nparams, natoms, perm_scale, deriv_const,
+        g_gpu.h_frame.cheby_fix_type, g_gpu.h_frame.cheby_smooth_distance,
+        fit_stress, fit_energy,
         g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
         g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
         g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,
@@ -1109,7 +1206,9 @@ bool lsq_gpu_launch_deriv_4b_device(
     if (!g_gpu.initialized || nquads == 0) return true;
     int block = 256, grid = (nquads + block - 1) / block;
     kDeriv4B<<<grid, block>>>(nquads, g_gpu.d_quads, g_gpu.d_quad_clusters, g_gpu.d_quad_power_terms,
-        nparams, natoms, perm_scale, deriv_const, fit_stress, fit_energy,
+        nparams, natoms, perm_scale, deriv_const,
+        g_gpu.h_frame.cheby_fix_type, g_gpu.h_frame.cheby_smooth_distance,
+        fit_stress, fit_energy,
         g_gpu.d_fx, g_gpu.d_fy, g_gpu.d_fz,
         g_gpu.d_stress_xx, g_gpu.d_stress_xy, g_gpu.d_stress_xz,
         g_gpu.d_stress_yy, g_gpu.d_stress_yz, g_gpu.d_stress_zz,

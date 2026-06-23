@@ -22,6 +22,16 @@ static int cheby_type_to_int(Cheby_trans t)
     }
 }
 
+static int cheby_fix_to_int(Cheby_fix t)
+{
+    switch (t) {
+    case Cheby_fix::ZERO_DERIV:     return 0;
+    case Cheby_fix::CONSTANT_DERIV: return 1;
+    case Cheby_fix::SMOOTH:         return 2;
+    default:                        return 2;
+    }
+}
+
 static void fill_pair_params(vector<PAIRS> &ff, std::vector<LSQPairParams> &h_pp)
 {
     h_pp.resize(ff.size());
@@ -172,6 +182,7 @@ static bool upload_frame_geometry(FRAME &system, NEIGHBORS &nlist, JOB_CONTROL &
     frame.nall = nall;
     frame.natmtyp = controls.NATMTYP;
     frame.use_mic = (system.ATOMS == system.ALL_ATOMS) ? 1 : 0;
+    frame.cheby_fix_type = cheby_fix_to_int(controls.cheby_fix_type);
     frame.rcut_2b = nlist.MAX_CUTOFF;
     frame.rcut_3b = nlist.MAX_CUTOFF_3B;
     frame.rcut_4b = nlist.MAX_CUTOFF_4B;
@@ -179,6 +190,7 @@ static bool upload_frame_geometry(FRAME &system, NEIGHBORS &nlist, JOB_CONTROL &
     frame.perm_2b = nlist.PERM_SCALE[2];
     frame.perm_3b = nlist.PERM_SCALE[3];
     frame.perm_4b = nlist.PERM_SCALE[4];
+    frame.cheby_smooth_distance = controls.cheby_smooth_distance;
 
     return lsq_gpu_upload_frame(coords.data(), nall, parent.data(), atype_idx.data(), &box, &frame);
 }
@@ -276,7 +288,7 @@ bool lsq_gpu_deriv_cheby(Cheby &cheby, A_MAT &a_matrix,
     std::vector<double> h_syy(nparams, 0.0), h_syz(nparams, 0.0), h_szz(nparams, 0.0);
     std::vector<double> h_ener(nparams, 0.0);
 
-    lsq_gpu_begin_frame_accum(nparams, natoms);
+    if (!lsq_gpu_begin_frame_accum(nparams, natoms)) return false;
 
     int npairs = 0, ntrips = 0, nquads = 0;
 

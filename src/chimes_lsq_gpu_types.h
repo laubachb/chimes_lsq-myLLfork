@@ -21,6 +21,7 @@ struct LSQFrameGpu {
     int    nall;
     int    natmtyp;
     int    use_mic;          // natoms == nall
+    int    cheby_fix_type;   // 0=ZERO_DERIV  1=CONSTANT_DERIV  2=SMOOTH
     double rcut_2b;
     double rcut_3b;
     double rcut_4b;
@@ -28,6 +29,7 @@ struct LSQFrameGpu {
     double perm_2b;
     double perm_3b;
     double perm_4b;
+    double cheby_smooth_distance;
 };
 
 struct LSQPairParams {
@@ -93,7 +95,7 @@ struct LSQQuadGpu {
 
 bool lsq_gpu_is_initialized();
 
-void lsq_gpu_begin_frame_accum(int nparams, int natoms);
+bool lsq_gpu_begin_frame_accum(int nparams, int natoms);
 
 bool lsq_gpu_launch_deriv_2b(
     int npairs, int nparams, int natoms, int n_pair_types,

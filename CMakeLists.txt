@@ -27,7 +27,7 @@ set(CMAKE_VERBOSE_MAKEFILE on) # Uncomment if you want to see compiler flags
 set(DEBUG_CHEBY "0" CACHE STRING "Debug verbosity level")
 set(VERBOSITY   "1" CACHE STRING "General verbosity level")
 set(USE_MPI     "1" CACHE STRING "Use MPI")
-option(WITH_CUDA "Build GPU A-matrix acceleration (2-body derivatives)" OFF)
+option(WITH_CUDA "Build GPU A-matrix acceleration (Chebyshev derivatives)" OFF)
 
 # Set preprocessor flags to user-specified values, if available
 
