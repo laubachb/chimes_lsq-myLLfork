@@ -247,7 +247,7 @@ This keyword defines whether charges should be fit, or held fixed at user-define
 ``BINARYA``
 """""""""""
 
-If ``true``, write force-row contributions to a binary ``A.NNNN.bin`` file in addition to ``A.NNNN.txt``. Stress and energy rows remain text-only. Can also be set via ``CHIMES_LSQ_BINARY_A=1``. The Python solver does not yet read binary A files.
+If ``true``, write every ``A``-matrix row (force, stress, and energy, whichever are being fit) to a binary ``A.NNNN.bin`` file in addition to ``A.NNNN.txt``. Set ``CHIMES_LSQ_SKIP_TEXT_A=1`` (or ``CHIMES_LSQ_BINARY_ONLY=1`` alongside this) to suppress the text file and write binary only. Can also be set via ``CHIMES_LSQ_BINARY_A=1``. The Python solver does not yet read binary A files.
 
 
 ``CHBTYPE``

@@ -26,7 +26,9 @@ export hosttype=UT-TACC-GPU
 ./install.sh 0 "" 1 1 1
 ```
 
-See [doc/GPU_ACCELERATION.md](doc/GPU_ACCELERATION.md) for runtime options, validation, and known limitations.
+Building manually on a machine without a site module stack? Pass `-DCMAKE_CUDA_ARCHITECTURES=<your GPU's compute capability>` explicitly — it's not set automatically and an unset/mismatched value can build cleanly but fail at runtime.
+
+See [doc/GPU_ACCELERATION.md](doc/GPU_ACCELERATION.md) for prerequisites, manual build instructions, runtime options, validation, and troubleshooting.
 
 <hr>
 
