@@ -10,7 +10,7 @@ Optional CUDA support speeds up the Chebyshev derivative step that builds the de
 | 3-body (`Deriv_3B`) CUDA kernel | Implemented |
 | 4-body (`Deriv_4B`) CUDA kernel | Implemented |
 | MPI rank → GPU device mapping | Implemented |
-| GPU neighbor enumeration (fused 2B/3B/4B) | Implemented |
+| GPU neighbor enumeration (fused 2B/3B/4B) | Implemented (2B brute-force O(N·nall); 3B/4B neighbor-list-bound, see below) |
 | Static device table cache | Implemented |
 | Inner-cutoff Cheby fixes (`ZERO_DERIV`, `CONSTANT_DERIV`, `SMOOTH`) | Implemented |
 | Binary A-matrix output (force/stress/energy rows) | Implemented |
@@ -84,6 +84,21 @@ When `USE_GPU` is enabled, the GPU path now:
 1. **Skips CPU neighbor-list rebuild** (`DO_UPDATE`) and enumerates pairs/trips/quads on device from coordinates (MIC-aware).
 2. **Caches static tables** on device (pair params, cluster metadata, type lookup maps) across frames.
 3. **Fuses enumeration + derivative kernels** — no host-side `build_*` pair lists.
+4. **3B/4B enumeration is neighbor-list-bound, not brute-force.** Each real atom's
+   candidate set is built once per frame (`kBuildNeighborList`, O(natoms·nall),
+   same cost class as 2B) at the 3B/4B cutoff radius, capped at
+   `LSQ_GPU_MAX_NEIGH3`/`LSQ_GPU_MAX_NEIGH4` (256/96, see `chimes_lsq_gpu.cu`).
+   3B/4B combinations are then generated only from that list — O(natoms·k²)/
+   O(natoms·k³) with k ≤ the cap, instead of the previous O(natoms·nall²)/
+   O(natoms·nall³) all-tuples scan, which could exceed `INT_MAX` threads and
+   silently fall back to CPU for non-trivial systems (ghost-inflated `nall` in
+   the thousands made 4B enumeration infeasible). This restriction is exact,
+   not approximate: any valid cluster containing atom `a1` must have every
+   other member within `a1`'s cutoff, so neither candidate set narrowing nor
+   the existing per-edge distance checks change which clusters are found —
+   only how many wasted candidates are evaluated to find them. If the actual
+   neighbor count exceeds the cap, enumeration fails cleanly (logged) and
+   falls back to the CPU path rather than truncating results.
 4. **Optional binary-only A output** — set `CHIMES_LSQ_BINARY_A=1` and `CHIMES_LSQ_BINARY_ONLY=1` (or `# BINARYA #` + skip text) to write `A.NNNN.bin` without `A.NNNN.txt`. Stress and energy rows are included in binary when fitted.
 
 | Variable | Effect |

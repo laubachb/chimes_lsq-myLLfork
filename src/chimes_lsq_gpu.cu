@@ -13,6 +13,13 @@
 #include <climits>
 
 #define MAX_POLY_ORDER LSQ_MAX_POLY_ORDER
+
+// Per-atom candidate-neighbor caps for 3B/4B enumeration (see kBuildNeighborList).
+// 4B uses its own (smaller) cap since rcut_4b is typically <= rcut_3b in practice.
+// If a real system needs more, lsq_gpu_enumerate_3b/4b fail cleanly (overflow
+// detected) and the caller falls back to the CPU path -- never silently wrong.
+#define LSQ_GPU_MAX_NEIGH3 256
+#define LSQ_GPU_MAX_NEIGH4 96
 #define CUDA_CHECK(call) do {                                                   \
     cudaError_t _e = (call);                                                    \
     if (_e != cudaSuccess) {                                                    \
@@ -59,6 +66,13 @@ struct LSQGpuState {
     LSQFrameGpu h_frame;
     int max_coords;
     unsigned int *d_enum_counter;
+
+    // Per-atom candidate-neighbor lists (Tier 2: bound 3B/4B enumeration by
+    // actual neighbor count instead of brute-forcing all-tuples of nall atoms).
+    int *d_neigh3_list, *d_neigh3_count;
+    int *d_neigh4_list, *d_neigh4_count;
+    int max_neigh_atoms;
+    unsigned int *d_neigh_overflow;
 
     int fit_stress, fit_energy;
     int use_3b, use_4b;
@@ -517,7 +531,8 @@ __global__ void kEnum2B(const double *coords, const int *parent, const int *atyp
     o_rab[slot * 3 + 2] = rz;
 }
 
-__global__ void kEnum3B(const double *coords, const int *parent, const int *atype,
+__global__ void kEnum3B(const int *neigh_list, const int *neigh_count, int max_neigh,
+                        const double *coords, const int *parent, const int *atype,
                         const int *ipm, const LSQPairParams *pp,
                         const int *trip_map, const int *trip_pair_idx,
                         const LSQClusterGpu *clusters,
@@ -525,15 +540,19 @@ __global__ void kEnum3B(const double *coords, const int *parent, const int *atyp
                         LSQTripGpu *out, unsigned int *counter, int cap)
 {
     long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    int nall = frame.nall;
     int natoms = frame.natoms;
-    long long jobs = (long long)natoms * nall * nall;
+    long long jobs = (long long)natoms * max_neigh * max_neigh;
     if (tid >= jobs) return;
 
-    int a1 = (int)(tid / ((long long)nall * nall));
-    long long rem = tid % ((long long)nall * nall);
-    int a2 = (int)(rem / nall);
-    int a3 = (int)(rem % nall);
+    int a1 = (int)(tid / ((long long)max_neigh * max_neigh));
+    long long rem = tid % ((long long)max_neigh * max_neigh);
+    int nj = (int)(rem / max_neigh);
+    int nk = (int)(rem % max_neigh);
+    int cnt = neigh_count[a1];
+    if (cnt > max_neigh) cnt = max_neigh;
+    if (nj >= cnt || nk >= cnt) return;
+    int a2 = neigh_list[a1 * max_neigh + nj];
+    int a3 = neigh_list[a1 * max_neigh + nk];
     if (a2 == a1 || a3 == a1 || a3 == a2) return;
     if (frame.perm_3b == 1.0 && (a1 > parent[a2] || a1 > parent[a3])) return;
     if (frame.perm_3b == 1.0 && parent[a2] > parent[a3]) return;
@@ -587,7 +606,8 @@ __global__ void kEnum3B(const double *coords, const int *parent, const int *atyp
     out[slot] = tr;
 }
 
-__global__ void kEnum4B(const double *coords, const int *parent, const int *atype,
+__global__ void kEnum4B(const int *neigh_list, const int *neigh_count, int max_neigh,
+                        const double *coords, const int *parent, const int *atype,
                         const int *ipm, const LSQPairParams *pp,
                         const int *quad_map, const int *quad_pair_idx,
                         const LSQClusterGpu *clusters,
@@ -595,18 +615,23 @@ __global__ void kEnum4B(const double *coords, const int *parent, const int *atyp
                         LSQQuadGpu *out, unsigned int *counter, int cap)
 {
     long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    int nall = frame.nall;
     int natoms = frame.natoms;
-    long long cube = (long long)nall * nall * nall;
+    long long cube = (long long)max_neigh * max_neigh * max_neigh;
     long long jobs = (long long)natoms * cube;
     if (tid >= jobs) return;
 
     int a1 = (int)(tid / cube);
     long long rem = tid % cube;
-    int a2 = (int)(rem / ((long long)nall * nall));
-    rem = rem % ((long long)nall * nall);
-    int a3 = (int)(rem / nall);
-    int a4 = (int)(rem % nall);
+    int j = (int)(rem / ((long long)max_neigh * max_neigh));
+    rem = rem % ((long long)max_neigh * max_neigh);
+    int k = (int)(rem / max_neigh);
+    int l = (int)(rem % max_neigh);
+    int cnt = neigh_count[a1];
+    if (cnt > max_neigh) cnt = max_neigh;
+    if (j >= cnt || k >= cnt || l >= cnt) return;
+    int a2 = neigh_list[a1 * max_neigh + j];
+    int a3 = neigh_list[a1 * max_neigh + k];
+    int a4 = neigh_list[a1 * max_neigh + l];
 
     if (a2 == a1 || a3 == a1 || a4 == a1 || a3 == a2 || a4 == a2 || a4 == a3) return;
     if (frame.perm_4b == 1.0 &&
@@ -817,6 +842,11 @@ void lsq_gpu_finalize()
     if (g_gpu.d_quad_map) cudaFree(g_gpu.d_quad_map);
     if (g_gpu.d_quad_pair_idx) cudaFree(g_gpu.d_quad_pair_idx);
     if (g_gpu.d_enum_counter) cudaFree(g_gpu.d_enum_counter);
+    if (g_gpu.d_neigh3_list) cudaFree(g_gpu.d_neigh3_list);
+    if (g_gpu.d_neigh3_count) cudaFree(g_gpu.d_neigh3_count);
+    if (g_gpu.d_neigh4_list) cudaFree(g_gpu.d_neigh4_list);
+    if (g_gpu.d_neigh4_count) cudaFree(g_gpu.d_neigh4_count);
+    if (g_gpu.d_neigh_overflow) cudaFree(g_gpu.d_neigh_overflow);
     g_gpu = {};
 }
 
@@ -1096,6 +1126,78 @@ static bool grid_for_jobs(long long jobs, int block, int *grid)
     return true;
 }
 
+// Build, for every real atom a1 in [0,natoms), the list of atom-buffer indices
+// (real or ghost) within rcut_list of a1. Any valid 3B/4B cluster containing a1
+// must have every other member within its cutoff of a1 too (the kEnum3B/kEnum4B
+// per-edge distance checks already enforce this) -- so this list is an exact
+// candidate set, not an approximation, as long as rcut_list >= the cutoff being
+// enumerated against.
+__global__ void kBuildNeighborList(const double *coords, LSQBoxGpu box, LSQFrameGpu frame,
+                                   double rcut_list, int max_neigh,
+                                   int *out_list, int *out_count, unsigned int *overflow)
+{
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    int nall = frame.nall;
+    int natoms = frame.natoms;
+    long long jobs = (long long)natoms * nall;
+    if (tid >= jobs) return;
+
+    int a1 = (int)(tid / nall);
+    int cand = (int)(tid % nall);
+    if (cand == a1) return;
+
+    double rx, ry, rz, rlen;
+    lsq_get_dist(coords, &box, a1, cand, frame.use_mic, rx, ry, rz, rlen);
+    if (rlen >= rcut_list) return;
+
+    int slot = atomicAdd(&out_count[a1], 1);
+    if (slot >= max_neigh) { atomicOr(overflow, 1u); return; }
+    out_list[a1 * max_neigh + slot] = cand;
+}
+
+static bool ensure_neigh(int natoms)
+{
+    if (g_gpu.max_neigh_atoms >= natoms && g_gpu.d_neigh3_list) return true;
+    free_device_ptr(g_gpu.d_neigh3_list);
+    free_device_ptr(g_gpu.d_neigh3_count);
+    free_device_ptr(g_gpu.d_neigh4_list);
+    free_device_ptr(g_gpu.d_neigh4_count);
+    int cap = (natoms < 256) ? 256 : natoms;
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_neigh3_list, (size_t)cap * LSQ_GPU_MAX_NEIGH3 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_neigh3_count, cap * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_neigh4_list, (size_t)cap * LSQ_GPU_MAX_NEIGH4 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&g_gpu.d_neigh4_count, cap * sizeof(int)));
+    if (!g_gpu.d_neigh_overflow)
+        CUDA_CHECK(cudaMalloc(&g_gpu.d_neigh_overflow, sizeof(unsigned int)));
+    g_gpu.max_neigh_atoms = cap;
+    return true;
+}
+
+static bool build_neighbor_list(double rcut_list, int max_neigh, int *d_list, int *d_count)
+{
+    int natoms = g_gpu.h_frame.natoms;
+    int nall = g_gpu.h_frame.nall;
+    CUDA_CHECK(cudaMemset(d_count, 0, natoms * sizeof(int)));
+    unsigned int z = 0;
+    CUDA_CHECK(cudaMemcpy(g_gpu.d_neigh_overflow, &z, sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+    long long jobs = (long long)natoms * nall;
+    int block = 256, grid = 0;
+    if (!grid_for_jobs(jobs, block, &grid)) return false;
+    if (grid > 0) {
+        kBuildNeighborList<<<grid, block>>>(g_gpu.d_coords, g_gpu.h_box, g_gpu.h_frame,
+            rcut_list, max_neigh, d_list, d_count, g_gpu.d_neigh_overflow);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    unsigned int overflow = 0;
+    CUDA_CHECK(cudaMemcpy(&overflow, g_gpu.d_neigh_overflow, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    if (overflow) {
+        fprintf(stderr, "GPU neighbor-list overflow (cap=%d); increase LSQ_GPU_MAX_NEIGH3/4 or reduce cutoff/system size\n", max_neigh);
+        return false;
+    }
+    return true;
+}
+
 bool lsq_gpu_enumerate_2b(int *out_npairs)
 {
     if (!g_gpu.initialized) return false;
@@ -1124,14 +1226,19 @@ bool lsq_gpu_enumerate_3b(int *out_ntrips)
     unsigned int z = 0;
     CUDA_CHECK(cudaMemcpy(g_gpu.d_enum_counter, &z, sizeof(unsigned int), cudaMemcpyHostToDevice));
 
-    int nall = g_gpu.h_frame.nall;
     int natoms = g_gpu.h_frame.natoms;
-    long long jobs = (long long)natoms * nall * nall;
+    if (!ensure_neigh(natoms)) return false;
+    double rcut_list = g_gpu.h_frame.rcut_3b + g_gpu.h_frame.rcut_pad;
+    if (!build_neighbor_list(rcut_list, LSQ_GPU_MAX_NEIGH3, g_gpu.d_neigh3_list, g_gpu.d_neigh3_count))
+        return false;
+
+    long long jobs = (long long)natoms * LSQ_GPU_MAX_NEIGH3 * LSQ_GPU_MAX_NEIGH3;
     int block = 256;
     int grid = 0;
     if (!grid_for_jobs(jobs, block, &grid)) return false;
     if (grid == 0) { *out_ntrips = 0; return true; }
-    kEnum3B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
+    kEnum3B<<<grid, block>>>(g_gpu.d_neigh3_list, g_gpu.d_neigh3_count, LSQ_GPU_MAX_NEIGH3,
+        g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
         g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.d_trip_map, g_gpu.d_trip_pair_idx,
         g_gpu.d_trip_clusters, g_gpu.h_box, g_gpu.h_frame,
         g_gpu.d_trips, g_gpu.d_enum_counter, cap);
@@ -1146,15 +1253,20 @@ bool lsq_gpu_enumerate_4b(int *out_nquads)
     unsigned int z = 0;
     CUDA_CHECK(cudaMemcpy(g_gpu.d_enum_counter, &z, sizeof(unsigned int), cudaMemcpyHostToDevice));
 
-    int nall = g_gpu.h_frame.nall;
     int natoms = g_gpu.h_frame.natoms;
-    long long cube = (long long)nall * nall * nall;
+    if (!ensure_neigh(natoms)) return false;
+    double rcut_list = g_gpu.h_frame.rcut_4b + g_gpu.h_frame.rcut_pad;
+    if (!build_neighbor_list(rcut_list, LSQ_GPU_MAX_NEIGH4, g_gpu.d_neigh4_list, g_gpu.d_neigh4_count))
+        return false;
+
+    long long cube = (long long)LSQ_GPU_MAX_NEIGH4 * LSQ_GPU_MAX_NEIGH4 * LSQ_GPU_MAX_NEIGH4;
     long long jobs = (long long)natoms * cube;
     int block = 256;
     int grid = 0;
     if (!grid_for_jobs(jobs, block, &grid)) return false;
     if (grid == 0) { *out_nquads = 0; return true; }
-    kEnum4B<<<grid, block>>>(g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
+    kEnum4B<<<grid, block>>>(g_gpu.d_neigh4_list, g_gpu.d_neigh4_count, LSQ_GPU_MAX_NEIGH4,
+        g_gpu.d_coords, g_gpu.d_parent, g_gpu.d_atom_type_idx,
         g_gpu.d_ipm, g_gpu.d_pair_params, g_gpu.d_quad_map, g_gpu.d_quad_pair_idx,
         g_gpu.d_quad_clusters, g_gpu.h_box, g_gpu.h_frame,
         g_gpu.d_quads, g_gpu.d_enum_counter, cap);
