@@ -149,6 +149,10 @@ public:
 	int    FREQ_DFTB_GEN;	      // Replaces gen_freq... How often to write the gen file.
 	string TRAJ_FORMAT;	      // .gen, .xyzf, or .lammps (currently)
 	bool   SPLIT_FILES ;	      // If TRUE, do not concatenate A matrix files for LSQ.
+	bool   BINARY_A ;             // If TRUE, write A matrix rows as binary doubles (A.NNNN.bin).
+	bool   TEXT_A ;               // If TRUE, write A matrix as text (default). May disable when BINARY_A only.
+	bool   USE_GPU ;              // If TRUE, use GPU for Chebyshev derivative accumulation when built with CUDA.
+	int    GPU_BATCH_FRAMES ;     // CUDA sync batching interval (1 = every frame).
 	bool   HIERARCHICAL_FIT;      // If true, allows 2-body and 1-body interctions to be excluded from fitting
 	int    FREQ_BACKUP;	      // How often to write backup files for restart.
 	bool   PRINT_VELOC;	      // If true, write out the velocities 
@@ -246,6 +250,10 @@ public:
 		USE_3B_CHEBY = false;	// Replaces if_3b_cheby... If true, calculate 3-Body Chebyshev interaction.
 		USE_4B_CHEBY = false;	//If true, calculate 4-Body Chebyshev interaction.
 		SPLIT_FILES  = false ;
+		BINARY_A     = false ;
+		TEXT_A       = true ;
+		USE_GPU      = false ;
+		GPU_BATCH_FRAMES = 1 ;
 		TOT_ALL_PARAMS = 0 ;
 		SERIAL_CHIMES = false ;
 		USE_KILL_LEN = false;

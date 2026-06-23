@@ -104,7 +104,9 @@ On the `LLNL-hosted Bitbucket repository <https://mybitbucket.llnl.gov/projects/
 Compiling and running the code
 ****************************************
 
-Navigate to the root project directory (e.g, chimes_lsq-myLLfork), and then execute ``ls modfiles``. You will see a list of files named like UM-ARC.mod. The name of these files correspond to different high-performance computing systems (HPC) and contain the modules necessary to compile the code on those platforms. e.g., UM-ARC is for the UM ARC Great Lakes HPC. If you are on one of these computers, execute, e.g.,  ``export hosttype=UM-ARC`` prior to installation. To complete installation, execute ``./install.sh`` in the root project directory. 
+Navigate to the root project directory (e.g, chimes_lsq-myLLfork), and then execute ``ls modfiles``. You will see a list of files named like UM-ARC.mod. The name of these files correspond to different high-performance computing systems (HPC) and contain the modules necessary to compile the code on those platforms. e.g., UM-ARC is for the UM ARC Great Lakes HPC. If you are on one of these computers, execute, e.g.,  ``export hosttype=UM-ARC`` prior to installation. To complete installation, execute ``./install.sh`` in the root project directory.
+
+For CUDA-enabled A-matrix acceleration on Stampede3, use ``export hosttype=UT-TACC-GPU`` and ``./install.sh 0 "" 1 1 1`` (fifth argument enables GPU). See :ref:`GPU acceleration <page-gpu_acceleration>`.
 
 .. note::
 

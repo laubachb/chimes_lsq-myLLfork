@@ -238,6 +238,18 @@ This keyword controls if and how per-configuration energies are included in the 
 This keyword defines whether charges should be fit, or held fixed at user-defined values. Note that currently, functionality is only supported when ``FITCOUL`` is true, or when ``FITCOUL`` is false and all charges are zero.  If ``FITCOUL`` is false, but charges are non-zero, program will attempt to subtract charge contributions from forces.
 
 
+``USEGPU``
+""""""""""
+
+*(CUDA build only.)* If ``true``, compute Chebyshev A-matrix derivatives on the GPU when supported. Requires a build with ``./install.sh ... 1`` as the fifth argument (``-DWITH_CUDA=ON``). Falls back to CPU for hierarchical fits, Coulomb fitting, or unsupported options. Can also be set via ``CHIMES_LSQ_USE_GPU=1``. See :ref:`GPU acceleration <page-gpu_acceleration>`.
+
+
+``BINARYA``
+"""""""""""
+
+If ``true``, write force-row contributions to a binary ``A.NNNN.bin`` file in addition to ``A.NNNN.txt``. Stress and energy rows remain text-only. Can also be set via ``CHIMES_LSQ_BINARY_A=1``. The Python solver does not yet read binary A files.
+
+
 ``CHBTYPE``
 """"""""""""
 

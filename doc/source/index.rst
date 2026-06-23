@@ -22,6 +22,7 @@ For additional information, see:
    quick_start
    chimes_overview
    lsq_input_file
+   gpu_acceleration
    units
    citing
    contributing

@@ -194,6 +194,8 @@ void INPUT::PARSE_INFILE_LSQ(  JOB_CONTROL	 & CONTROLS,
 	PARSE_CONTROLS_TRJFILE(CONTROLS);	
 	PARSE_CONTROLS_WRAPTRJ(CONTROLS);
 	PARSE_CONTROLS_SPLITFI(CONTROLS);
+	PARSE_CONTROLS_USEGPU(CONTROLS);
+	PARSE_CONTROLS_BINARYA(CONTROLS);
 	PARSE_CONTROLS_HIERARC(CONTROLS);
 	PARSE_CONTROLS_NFRAMES(CONTROLS);
 	PARSE_CONTROLS_NLAYERS(CONTROLS);
@@ -460,6 +462,40 @@ void INPUT::PARSE_CONTROLS_SPLITFI(JOB_CONTROL & CONTROLS)
 			if ( RANK == 0 ) 
 				cout << "	# SPLITFI #: " << bool2str(CONTROLS.SPLIT_FILES) << endl;	
 			
+			break;
+		}
+	}
+}
+void INPUT::PARSE_CONTROLS_USEGPU(JOB_CONTROL & CONTROLS)
+{
+	int N_CONTENTS = CONTENTS.size();
+
+	for (int i=0; i<N_CONTENTS; i++)
+	{
+		if (found_input_keyword("USEGPU", CONTENTS(i)))
+		{
+			CONTROLS.USE_GPU = convert_bool(CONTENTS(i+1,0),i+1);
+
+			if ( RANK == 0 )
+				cout << "	# USEGPU #: " << bool2str(CONTROLS.USE_GPU) << endl;
+
+			break;
+		}
+	}
+}
+void INPUT::PARSE_CONTROLS_BINARYA(JOB_CONTROL & CONTROLS)
+{
+	int N_CONTENTS = CONTENTS.size();
+
+	for (int i=0; i<N_CONTENTS; i++)
+	{
+		if (found_input_keyword("BINARYA", CONTENTS(i)))
+		{
+			CONTROLS.BINARY_A = convert_bool(CONTENTS(i+1,0),i+1);
+
+			if ( RANK == 0 )
+				cout << "	# BINARYA #: " << bool2str(CONTROLS.BINARY_A) << endl;
+
 			break;
 		}
 	}

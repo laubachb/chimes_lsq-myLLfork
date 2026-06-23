@@ -27,6 +27,7 @@ set(CMAKE_VERBOSE_MAKEFILE on) # Uncomment if you want to see compiler flags
 set(DEBUG_CHEBY "0" CACHE STRING "Debug verbosity level")
 set(VERBOSITY   "1" CACHE STRING "General verbosity level")
 set(USE_MPI     "1" CACHE STRING "Use MPI")
+option(WITH_CUDA "Build GPU A-matrix acceleration (Chebyshev derivatives)" OFF)
 
 # Set preprocessor flags to user-specified values, if available
 
@@ -43,13 +44,7 @@ include_directories(imports/chimes_calculator/chimesFF/src)
 
 set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY true)
 
-############################################################
-# Executables for chimes_lsq
-############################################################
-
-# Define an executable target
-
-add_executable(chimes_lsq
+set(CHIMES_LSQ_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/chimes_lsq.C 
     ${CMAKE_CURRENT_SOURCE_DIR}/src/functions.C 
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Ewald.C 
@@ -64,6 +59,26 @@ add_executable(chimes_lsq
     ${CMAKE_CURRENT_SOURCE_DIR}/src/input.C
 )
 
+if(WITH_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_definitions(-DUSE_CUDA)
+    list(APPEND CHIMES_LSQ_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/chimes_lsq_gpu.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/chimes_lsq_gpu_host.cpp
+    )
+    set(CMAKE_CUDA_STANDARD 14)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
+############################################################
+# Executables for chimes_lsq
+############################################################
+
+# Define an executable target
+
+add_executable(chimes_lsq ${CHIMES_LSQ_SOURCES})
+
 # Define properties for the executable target
 
 target_include_directories(chimes_lsq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/)
@@ -71,6 +86,10 @@ target_compile_features   (chimes_lsq PRIVATE cxx_std_11)
 if (USE_MPI)
 target_link_libraries     (chimes_lsq ${MPI_LIBRARIES})
 endif (USE_MPI)
+if(WITH_CUDA)
+target_link_libraries     (chimes_lsq CUDA::cudart)
+set_target_properties(chimes_lsq PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
 target_link_directories   (chimes_lsq PUBLIC imports/chimes_calculator/build)
 target_link_libraries     (chimes_lsq libchimescalc.so)
 set_target_properties(chimes_lsq PROPERTIES INSTALL_RPATH ${CMAKE_CURRENT_SOURCE_DIR}/imports/chimes_calculator/build/)

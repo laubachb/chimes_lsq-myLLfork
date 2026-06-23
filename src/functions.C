@@ -14,6 +14,10 @@
 #include "io_styles.h"
 #include "A_Matrix.h"
 
+#ifdef USE_CUDA
+#include "chimes_lsq_gpu.cuh"
+#endif
+
 #include "../imports/chimes_calculator/serial_interface/src/serial_chimes_interface.h"
 
 #ifdef USE_MPI
@@ -776,10 +780,16 @@ void ZCalc_Deriv (JOB_CONTROL & CONTROLS, vector<PAIRS> & FF_2BODY,  CLUSTER_LIS
 	
 	if ( FF_2BODY[0].PAIRTYP == "CHEBYSHEV" )
 	{
-		// Only enter if 2B are requested. For example, skip if user wants to fit ONLY 3B cheby
-		// i.e. PAIRTYP: CHEBYSHEV  0 6 or similar
-
 	  Cheby cheby{CONTROLS,FRAME_SYSTEM,NEIGHBOR_LIST,FF_2BODY,INT_PAIR_MAP} ;
+
+#ifdef USE_CUDA
+	  if (CONTROLS.USE_GPU) {
+		  if (lsq_gpu_deriv_cheby(cheby, A_MATRIX, TRIPS, QUADS))
+			  return;
+
+		  NEIGHBOR_LIST.DO_UPDATE(FRAME_SYSTEM, CONTROLS);
+	  }
+#endif
 
 	  if ( FF_2BODY[0].SNUM > 0)
 		 cheby.Deriv_2B(A_MATRIX) ;
@@ -1350,5 +1360,4 @@ static void ZCalc_Serial_Chimes(FRAME &SYSTEM, PAIR_FF &FF_2BODY)
             + SYSTEM.PRESSURE_TENSORS_XYZ_ALL[2].Z ;
     }
 }
-
 
